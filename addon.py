@@ -31,6 +31,7 @@ RESOLVE RECIPE (all fetches are tiny HTML/JSON text)
 
 import gzip
 import hashlib
+import html as _html
 import io
 import json
 import os
@@ -47,7 +48,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 BRAND   = "AnimeDekho"
 PORT    = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("ADK_PUBLIC_URL", "").rstrip("/")
@@ -270,8 +271,13 @@ def _norm(t):
     return re.sub(r"[^a-z0-9]", "", (t or "").lower())
 
 def _clean_title(t):
-    """Strip trailing dub/sub qualifiers: 'Naruto - Hindi Dub' -> 'Naruto'."""
+    """Strip trailing dub/sub qualifiers: 'Naruto - Hindi Dub' -> 'Naruto'.
+    v1.4.0: also strips trailing parentheticals the site loves —
+    'Demon Slayer Infinity Castle (Official)', 'Your Name. (Official Dub)',
+    'One Piece Film Red (Camrip)'."""
     t = (t or "").strip()
+    t = re.sub(r"\s*\((official|camrip|fandub|[a-z ]*dub[a-z ]*|"
+               r"[a-z ]*sub[a-z ]*)\)\s*$", "", t, flags=re.I).strip()
     pat = re.compile(r"\s*[-|:–—]?\s*(hindi|english|japanese|tamil|telugu|dub(bed)?"
                      r"|sub(titl(ed|es))?)(\s+(dub(bed)?|sub(titl(ed|es))?))*$",
                      re.I)
@@ -345,8 +351,8 @@ def _extract_cards(html):
         if not t:
             continue
         y = re.search(r'class="year">(\d{4})<', win)
-        out.append({"title": t.strip(), "url": m.group(1), "family": m.group(2),
-                    "year": y.group(1) if y else ""})
+        out.append({"title": _html.unescape(t.strip()), "url": m.group(1),
+                    "family": m.group(2), "year": y.group(1) if y else ""})
     return out
 
 def _kitsu_title(kid):
@@ -429,14 +435,18 @@ def _parse_series_page(url):
             val = None
         else:
             val = {"post_id": ids[0], "eps": eps,
-                   "title": (t.group(1).strip() if t else "")}
+                   "title": _html.unescape(t.group(1).strip()) if t else ""}
         _cache_put(_PAGE_CACHE, url, val, _PAGE_TTL if val else _NEG_TTL)
         return val
     except Exception:
         return None
 
 def _parse_movie_page(url):
-    """movie-hindi page -> {post_id, embed} (6h cached)."""
+    """movie-hindi page -> {post_id, embed} (6h cached).
+    v1.4.0: movie pages hide the embed behind a 'Skip AD' gate — the page
+    carries a form whose shortlink (24hr/verify.php?expires&token) sets the
+    toronites_server cookie; ONE direct GET of it (no shortener maze) and
+    a page reload reveals animedekho.app/embed/<id> (verified 2026-09-11)."""
     hit, val = _cache_get(_PAGE_CACHE, url)
     if hit:
         return val
@@ -446,13 +456,23 @@ def _parse_movie_page(url):
             return None
         h = r.text
         m = re.search(r'animedekho\.app/embed/(\d+)', h)
+        if not m:
+            sl = re.search(r'name="shortlink"\s+value="([^"]+)"', h)
+            if sl and "verify.php" in sl.group(1):
+                try:
+                    _get(sl.group(1), timeout=10)      # sets the gate cookie
+                    r = _get(url, timeout=10)          # reload: embed appears
+                    h = r.text
+                    m = re.search(r'animedekho\.app/embed/(\d+)', h)
+                except Exception:
+                    pass
         t = re.search(r'<h1 class="entry-title">([^<]*)</h1>', h)
         if not m:
             val = None
         else:
             val = {"post_id": m.group(1),
                    "embed": SITE + "/embed/" + m.group(1),
-                   "title": (t.group(1).strip() if t else "")}
+                   "title": _html.unescape(t.group(1).strip()) if t else ""}
         _cache_put(_PAGE_CACHE, url, val, _PAGE_TTL if val else _NEG_TTL)
         return val
     except Exception:
@@ -631,19 +651,52 @@ def _resolve_card(site_title, embed_url, ctype, se, ep, year):
         "bingeGroup": "adk|%s|%s:%s:%s" % (site_title, ctype, se, ep),
     }
 
+_GENERIC_TOK = {"the", "movie", "film", "official", "camrip", "dub", "dubbed",
+                "sub", "subbed", "hindi", "english", "japanese", "season",
+                "part", "and", "no", "yaiba", "tv", "ova", "ona", "special"}
+
+def _tokens(t):
+    """meaningful title tokens (>=4 chars, non-generic). NOTE: lower+split
+    directly — _norm() removes spaces too and would fuse the whole title
+    into one token."""
+    return {w for w in re.sub(r"[^a-z0-9\s]", " ", (t or "").lower()).split()
+            if len(w) >= 4 and w not in _GENERIC_TOK}
+
 def _match_candidates(cands, want_title, family):
-    """title-matched candidates for the requested type, best first."""
+    """title-matched candidates for the requested type, best first.
+    v1.4.0 tier 2.5 (token-subset): the site often SHORTENS official names —
+    'Demon Slayer: Kimetsu no Yaiba - The Movie: Infinity Castle' is listed
+    as 'Demon Slayer Infinity Castle'. If every meaningful token of the SITE
+    title appears in the requested title (>=2 site tokens so 'Naruto' can
+    never match a 'Naruto Shippuden' request), it's the same work."""
     want = _norm(want_title)
     fam = [c for c in cands if c.get("family") == family]
     exact = [c for c in fam if _norm(_clean_title(c["title"])) == want]
     if exact:
         return exact[:3]
-    # partial only for substantial queries — 'It' must not live inside everything
-    if len(want) < 6:
-        return []
-    partial = [c for c in fam
-               if want in _norm(c["title"]) or _norm(c["title"]) in want]
-    return partial[:3]
+    if len(want) >= 6:
+        # v1.4.0 xtream-lesson tightening: substring containment only counts
+        # when the CONTAINED side carries >=2 meaningful tokens (or is a
+        # long single norm) — 'Naruto' must not answer a 'Naruto Shippuden'
+        # request, but 'A Silent Voice' still answers 'A Silent Voice:
+        # The Movie'.
+        partial = [c for c in fam
+                   if (want in _norm(c["title"])
+                       and (len(_tokens(want_title)) >= 2 or len(want) >= 12))
+                   or (_norm(c["title"]) in want
+                       and (len(_tokens(c["title"])) >= 2
+                            or len(_norm(c["title"])) >= 12))]
+        if partial:
+            return partial[:3]
+    # token-subset tier: site name = shortened/parenthetical-stripped form
+    wtok = _tokens(want_title)
+    if len(wtok) >= 2:
+        subs = [c for c in fam
+                if len(_tokens(_clean_title(c["title"]))) >= 2
+                and _tokens(_clean_title(c["title"])) <= wtok]
+        if subs:
+            return subs[:3]
+    return []
 
 def _build_inner(ctype, imdb, se, ep):
     if (imdb or "").startswith("kitsu:"):

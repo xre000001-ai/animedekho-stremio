@@ -819,3 +819,70 @@ def test_v130_stream_route_accepts_kitsu_ids():
         assert code == 404 or code == 200   # regex miss -> 404 fallthrough
     finally:
         srv.shutdown(); srv.server_close()
+
+
+# --- v1.4.0: movie Skip-AD gate + html entities + token-subset matching --------
+
+def test_v140_movie_gate_unlock():
+    """Movie pages hide the embed behind a Skip-AD form; ONE GET of the
+    form's shortlink (verify.php) + page reload reveals it."""
+    gated = ('<form id="landing" method="post" action="https://animedekho.app/skip/vshort.php">'
+             '<input type="hidden" name="postlink" value="https://animedekho.app/movie-hindi/x-hin/">'
+             '<input type="hidden" name="shortlink" value="https://animedekho.app/24hr/verify.php?expires=99&token=abc">')
+    open_page = '<a href="https://animedekho.app/embed/129/x">play</a>'
+    seq = []
+    class R:
+        def __init__(self, text):
+            self.status_code = 200; self.text = text
+    def fake_get(url, timeout=10, referer=None):
+        seq.append(url)
+        if "verify.php" in url:
+            return R("ok")                     # sets the cookie
+        return R(open_page if len(seq) > 2 else gated)
+    addon._PAGE_CACHE.clear()
+    try:
+        with mock.patch.object(addon, "_get", side_effect=fake_get):
+            pg = addon._parse_movie_page("https://animedekho.app/movie-hindi/x-hin/")
+        assert pg and pg["post_id"] == "129"
+        assert pg["embed"] == "https://animedekho.app/embed/129"
+        assert seq[1].startswith("https://animedekho.app/24hr/verify.php")  # gate unlocked
+        assert seq[2] == "https://animedekho.app/movie-hindi/x-hin/"        # page reloaded
+    finally:
+        addon._PAGE_CACHE.clear()
+
+def test_v140_html_entities_in_titles():
+    class R:
+        status_code = 200
+        text = ('<article><h2 class="entry-title">Howl&#8217;s Moving Castle</h2>'
+                '<a href="https://animedekho.app/movie-hindi/howls-moving-castle/" '
+                'class="lnk-blk">x</a></article>')
+    with mock.patch.object(addon, "_get", return_value=R()):
+        cards = addon.site_search("howl")
+    assert cards and cards[0]["title"] == "Howl’s Moving Castle"
+
+def test_v140_clean_title_parentheticals():
+    assert addon._clean_title("Demon Slayer Infinity Castle (Official)") == \
+        "Demon Slayer Infinity Castle"
+    assert addon._clean_title("Your Name. (Official Dub)") == "Your Name."
+    assert addon._clean_title("One Piece Film Red (Camrip)") == "One Piece Film Red"
+
+def test_v140_token_subset_matching():
+    cands = [{"title": "Demon Slayer Infinity Castle (Official)", "family": "movie-hindi"},
+             {"title": "Naruto", "family": "series-hindi"},
+             {"title": "Naruto Shippuden", "family": "series-hindi"}]
+    # site shortens the official movie name -> subset tier matches it
+    m = addon._match_candidates(cands, "Demon Slayer: Kimetsu no Yaiba - The Movie: Infinity Castle",
+                                "movie-hindi")
+    assert m and "Infinity Castle" in m[0]["title"]
+    # single-token site title can NEVER match a longer different work
+    # (xtream lesson: wrong-title cards are worse than no cards)
+    m2 = addon._match_candidates([cands[1]], "Naruto Shippuden", "series-hindi")
+    assert m2 == []
+    # ...but subtitle containment of the SAME work still matches
+    m4 = addon._match_candidates(
+        [{"title": "A Silent Voice", "family": "movie-hindi"}],
+        "A Silent Voice: The Movie", "movie-hindi")
+    assert m4 and m4[0]["title"] == "A Silent Voice"
+    # exact still wins
+    m3 = addon._match_candidates(cands[1:], "Naruto Shippuden", "series-hindi")
+    assert m3 and m3[0]["title"] == "Naruto Shippuden"
