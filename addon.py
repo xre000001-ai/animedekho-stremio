@@ -792,6 +792,32 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps({"version": VERSION,
                                                "entries": _REQLOG[-120:]}))
 
+        if path == "/debug/master":
+            # fetch a master (via pool if needed) + its first variant; return
+            # the segment URL pattern so we can test cross-IP segment access
+            k = (q.get("k") or [""])[0]
+            u = (q.get("u") or [""])[0]
+            if k != "adk-dbg-9c2f" or not u.startswith("http"):
+                return self._send(404, json.dumps({"error": "not found"}))
+            try:
+                r = _get(u, timeout=14)
+                if r.status_code != 200:
+                    return self._send(200, json.dumps({"master_status": r.status_code}))
+                import urllib.parse as _up
+                lines = r.text.splitlines()
+                var = next((l for l in lines if l and not l.startswith("#")), "")
+                vurl = _up.urljoin(u, var)
+                r2 = _get(vurl, timeout=14)
+                segs = [l for l in r2.text.splitlines()
+                        if l and not l.startswith("#")][:2]
+                return self._send(200, json.dumps({
+                    "master": r.status_code, "variant": var,
+                    "variant_status": r2.status_code,
+                    "segs": [_up.urljoin(vurl, s) for s in segs]}))
+            except Exception as e:
+                return self._send(200, json.dumps(
+                    {"error": "%s: %s" % (type(e).__name__, str(e)[:120])}))
+
         if path == "/debug/search":
             # ground truth for site egress from THIS host (is the site
             # blocking datacenter IPs? status/bytes/cards tell us)
