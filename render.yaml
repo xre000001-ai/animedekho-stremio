@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: animedekho-stremio
+    runtime: python
+    plan: free
+    buildCommand: pip install requests
+    startCommand: python3 addon.py
+    healthCheckPath: /health
+    autoDeploy: true
