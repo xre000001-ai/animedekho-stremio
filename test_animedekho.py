@@ -412,3 +412,77 @@ if __name__ == "__main__":
            if k.startswith("test_") and callable(v)]
     run(fns)
     print("\n%d/%d tests passed" % (PASS, len(fns)))
+
+
+# --- v1.0.1: the Render-edge hang (Content-Length sent pre-gzip) ---------------
+
+def _srv_sock_request(port, path, accept_gzip):
+    """Raw-socket HTTP/1.1 GET: returns (code, headers, body-bytes-read).
+    Fails the test on timeout — a wrong Content-Length would hang here,
+    exactly like Render's edge in production."""
+    import socket
+    s = socket.create_connection(("127.0.0.1", port), timeout=6)
+    s.settimeout(6)
+    req = "GET %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nConnection: close\r\n" % (path, port)
+    if accept_gzip:
+        req += "Accept-Encoding: gzip\r\n"
+    s.sendall((req + "\r\n").encode())
+    buf = b""
+    try:
+        while True:
+            d = s.recv(65536)
+            if not d:
+                break
+            buf += d
+    except socket.timeout:
+        s.close()
+        raise AssertionError("response hung (Content-Length/body mismatch?) for %s gz=%s"
+                             % (path, accept_gzip))
+    s.close()
+    head, _, body = buf.partition(b"\r\n\r\n")
+    code = int(head.split(b" ")[1])
+    hdrs = dict((l.split(b":", 1)[0].strip().lower(),
+                 l.split(b":", 1)[1].strip()) for l in head.split(b"\r\n")[1:])
+    return code, hdrs, body
+
+def test_v101_gzip_content_length_consistency():
+    """The bug: Content-Length announced the PRE-gzip size, so every
+    gzipped response (Render's edge always asks for gzip) delivered fewer
+    bytes than promised and hung. CL must equal the actual body bytes."""
+    import threading, subprocess, sys, time, gzip as gzmod, os
+    port = 7831
+    env = dict(os.environ, PORT=str(port))
+    p = subprocess.Popen([sys.executable, "addon.py"], env=env,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        for _ in range(40):
+            time.sleep(0.25)
+            try:
+                import socket
+                socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
+                break
+            except OSError:
+                pass
+        # gzip ON: landing page is >512B -> gzipped; CL must match wire bytes
+        code, hdrs, body = _srv_sock_request(port, "/", accept_gzip=True)
+        assert code == 200
+        assert hdrs[b"content-encoding"] == b"gzip"
+        assert int(hdrs[b"content-length"]) == len(body), (
+            "CL %s != body %d (the v1.0.0 bug)" % (hdrs[b"content-length"], len(body)))
+        assert gzmod.decompress(body).decode().startswith("<!doctype html>")
+        # gzip ON but small json (<512B): NOT gzipped, still consistent
+        code, hdrs, body = _srv_sock_request(port, "/manifest.json", accept_gzip=True)
+        assert code == 200 and b"content-encoding" not in hdrs
+        assert int(hdrs[b"content-length"]) == len(body)
+        # plain (no Accept-Encoding): never gzipped, consistent
+        code, hdrs, body = _srv_sock_request(port, "/", accept_gzip=False)
+        assert code == 200 and b"content-encoding" not in hdrs
+        assert int(hdrs[b"content-length"]) == len(body)
+        assert body.decode().startswith("<!doctype html>")
+    finally:
+        p.terminate(); p.wait(timeout=10)
+
+def test_v101_debug_search_route_exists():
+    src = open("addon.py").read()
+    assert '"/debug/search"' in src
+    assert "status_code" in src and "_extract_cards" in src

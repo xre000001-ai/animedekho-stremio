@@ -45,7 +45,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 BRAND   = "AnimeDekho"
 PORT    = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("ADK_PUBLIC_URL", "").rstrip("/")
@@ -585,27 +585,36 @@ class Handler(BaseHTTPRequestHandler):
         print("[%s] %s" % (time.strftime("%H:%M:%S"), fmt % args), flush=True)
 
     def _send(self, code, body, ctype="application/json"):
+        # v1.0.1 CRITICAL FIX: gzip the body FIRST, then announce
+        # Content-Length. The old order sent the PRE-gzip length with a
+        # shorter gzipped body — Render's edge (which forwards
+        # Accept-Encoding: gzip) then waited forever for bytes that never
+        # came: every response >512B (landing page, reqlog, real stream
+        # cards) hung with zero bytes delivered. Responses <=512B skipped
+        # gzip and worked, which is why /health & /manifest looked fine.
         self._c = code
         if isinstance(body, str):
             body = body.encode()
+        gz = b""
+        if len(body) > 512 and "gzip" in (self.headers.get("Accept-Encoding") or ""):
+            buf = io.BytesIO()
+            with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as z:
+                z.write(body)
+            if len(buf.getvalue()) < len(body):
+                gz = buf.getvalue()
         try:
             self.send_response(code)
             self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Length", str(len(gz or body)))
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Cache-Control",
                              "public, max-age=300" if ctype != "application/json"
                              else "no-store")
-            if len(body) > 512 and "gzip" in (self.headers.get("Accept-Encoding") or ""):
-                buf = io.BytesIO()
-                with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz:
-                    gz.write(body)
-                if len(buf.getvalue()) < len(body):
-                    body = buf.getvalue()
-                    self.send_header("Content-Encoding", "gzip")
-                    self.send_header("Vary", "Accept-Encoding")
+            if gz:
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Vary", "Accept-Encoding")
             self.end_headers()
-            self.wfile.write(body)
+            self.wfile.write(gz or body)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
@@ -658,6 +667,23 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, json.dumps({"error": "not found"}))
             return self._send(200, json.dumps({"version": VERSION,
                                                "entries": _REQLOG[-120:]}))
+
+        if path == "/debug/search":
+            # ground truth for site egress from THIS host (is the site
+            # blocking datacenter IPs? status/bytes/cards tell us)
+            k = (q.get("k") or [""])[0]
+            kw = (q.get("q") or [""])[0]
+            if k != "adk-dbg-9c2f" or not kw:
+                return self._send(404, json.dumps({"error": "not found"}))
+            try:
+                r = _get(SITE + "/?s=" + quote(kw), timeout=10)
+                cards = _extract_cards(r.text) if r.status_code == 200 else []
+                return self._send(200, json.dumps({
+                    "status": r.status_code, "bytes": len(r.text),
+                    "cards": len(cards),
+                    "first": [{"t": c[0][:60], "url": c[1][:70]} for c in cards[:3]]}))
+            except Exception as e:
+                return self._send(200, json.dumps({"error": str(e)[:140]}))
 
         m = re.match(r"^/stream/(movie|series)/(tt\d+)(?::(\d+):(\d+))?\.json$", path)
         if m:
