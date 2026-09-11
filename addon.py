@@ -46,7 +46,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 BRAND   = "AnimeDekho"
 PORT    = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("ADK_PUBLIC_URL", "").rstrip("/")
@@ -240,11 +240,13 @@ def _get(url, timeout=8, referer=None):
             if r.status_code in (403, 406):
                 _POOL_BAD[u] = time.time() + 900   # exit blocked by site
             else:
-                _POOL_STICKY[0] = (u, time.time() + 90)
+                _POOL_STICKY[0] = u                # [url, expiry] pair
+                _POOL_STICKY[1] = time.time() + 90
                 return r
         except Exception:
             _POOL_BAD[u] = time.time() + 600       # dead exit
-        _POOL_STICKY[0] = (None, 0.0)
+        _POOL_STICKY[0] = None
+        _POOL_STICKY[1] = 0.0
     try:                                            # last resort: direct
         return _S.get(url, headers=hd, timeout=timeout)
     except Exception:

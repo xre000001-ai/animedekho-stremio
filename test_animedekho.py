@@ -498,7 +498,8 @@ class _Resp:
 def _reset_pool_state():
     addon._FREE_POOL[0] = []
     addon._POOL_BAD.clear()
-    addon._POOL_STICKY[0] = (None, 0.0)
+    addon._POOL_STICKY[0] = None
+    addon._POOL_STICKY[1] = 0.0
     addon._POOL_TS[0] = 0.0
     addon._DIRECT_OK_UNTIL[0] = 0.0
     addon._DIRECT_RETRY_AT[0] = float("inf")   # direct benched during tests
@@ -516,10 +517,13 @@ def test_v110_pool_used_when_direct_blocked():
         raise ConnectionError("dead exit")
     with mock.patch.object(addon._S, "get", side_effect=fake_get):
         addon._FREE_POOL[0] = ["http://dead:1", "http://p1:2"]
+        # sticky forces dead:1 to be tried FIRST (deterministic, not 50/50)
+        addon._POOL_STICKY[0] = "http://dead:1"
+        addon._POOL_STICKY[1] = time.time() + 60
         r = addon._get("https://animedekho.app/?s=demon")
     assert r.status_code == 200 and r.text == "ok-via-p1"
     assert all(c[1] for c in calls)               # every attempt went via proxy
-    assert addon._POOL_STICKY[0][0] == "http://p1:2"
+    assert addon._POOL_STICKY[0] == "http://p1:2"
     assert addon._POOL_BAD.get("http://dead:1", 0) > time.time()  # benched
     _reset_pool_state()
 
@@ -531,7 +535,8 @@ def test_v110_sticky_exit_reused():
         return _Resp(200, "x")
     with mock.patch.object(addon._S, "get", side_effect=fake_get):
         addon._FREE_POOL[0] = ["http://a:1", "http://b:2"]
-        addon._POOL_STICKY[0] = ("http://b:2", time.time() + 60)
+        addon._POOL_STICKY[0] = "http://b:2"
+        addon._POOL_STICKY[1] = time.time() + 60
         r1 = addon._get("https://animedekho.app/?s=one")
         r2 = addon._get("https://animedekho.app/series-hindi/x/")
     assert r1.status_code == r2.status_code == 200
