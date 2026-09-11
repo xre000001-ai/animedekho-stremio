@@ -2,6 +2,7 @@
 """Unit tests for the AnimeDekho addon. Run: python3 -m pytest test_animedekho.py -q
 Everything network-touching is mocked — hermetic and deterministic."""
 import json
+import re
 import sys
 import os
 import time
@@ -247,8 +248,12 @@ def test_resolve_card_full():
         card = addon._resolve_card("Jujutsu Kaisen",
                                    "https://animedekho.app/embed/95479/2-3",
                                    "series", 2, 3, "2020")
-    assert card and card["url"].startswith("https://as-cdn26.top/cdn/hls/")
-    assert card["url"] == json.loads(GETVIDEO_JSON)["videoSource"]
+    # v1.2.0: card points at OUR served route (cdn master is ip-bound)
+    assert card and re.match(r"^/hls/[a-f0-9]{16}/master\.m3u8$", card["url"])
+    # the served-route key maps back to the real (ip-bound) master url
+    vs = json.loads(GETVIDEO_JSON)["videoSource"]
+    key = card["url"].split("/")[2]
+    assert addon._hls_key(vs) == key and addon._HLS_KEYS.get(key) == vs
     assert "1080p" in card["description"] and "Hindi" in card["description"]
     assert card["subtitles"][0]["lang"] == "eng"
     assert card["behaviorHints"]["isBingeable"]
@@ -592,3 +597,106 @@ def test_v110_pool_exhausted_falls_back_direct():
 def test_v110_health_reports_egress():
     src = open("addon.py").read()
     assert '"egress"' in src and "_DIRECT_OK_UNTIL" in src.split('"egress"')[1][:200]
+
+
+# --- v1.2.0: served playlists (cdn master is IP-bound to the minting exit) ------
+
+MASTER_SAMPLE = """#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",LANGUAGE="hin",NAME="Hindi",DEFAULT=YES,AUTOSELECT=YES,URI="hin/audio.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1920x1080,CODECS="avc1.640028,mp4a.40.2",AUDIO="aud"
+/cdn/hls/abc/1080/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=1280x720,CODECS="avc1.64001f,mp4a.40.2",AUDIO="aud"
+/cdn/hls/abc/720/index.m3u8
+"""
+
+def test_v120_master_rewrite():
+    text, variants = addon._rewrite_master(
+        MASTER_SAMPLE, "https://as-cdn26.top/cdn/hls/abc/master.m3u8?md5=x&expires=1")
+    assert "\nv0.m3u8\n" in text and "\nv1.m3u8\n" in text
+    assert 'URI="a0.m3u8"' in text and "hin/audio.m3u8" not in text
+    assert "RESOLUTION=1920x1080" in text and 'AUDIO="aud"' in text
+    assert variants["v0.m3u8"] == "https://as-cdn26.top/cdn/hls/abc/1080/index.m3u8"
+    # relative (no leading /) audio uri resolves against the master's dir
+    assert variants["a0.m3u8"] == "https://as-cdn26.top/cdn/hls/abc/hin/audio.m3u8"
+    assert text.startswith("#EXTM3U")
+
+def test_v120_variant_text_absolutizes_relative_lines():
+    vtext = "#EXTM3U\n#EXTINF:5.0,\n/p/tok1\n#EXTINF:5.0,\nhttps://as-cdn27.top/p/tok2\n"
+    class R2:
+        status_code = 200; text = vtext
+    with mock.patch.object(addon, "_get", return_value=R2()):
+        out = addon._variant_text("https://as-cdn26.top/hls/xyz")
+    assert "https://as-cdn26.top/p/tok1" in out          # relative -> absolute
+    assert "https://as-cdn27.top/p/tok2" in out          # already absolute kept
+
+def test_v120_variant_text_negative_cache():
+    class R404:
+        status_code = 404; text = ""
+    with mock.patch.object(addon, "_get", return_value=R404()):
+        assert addon._variant_text("https://as-cdn26.top/hls/zzz") is None
+    hit, val = addon._cache_get(addon._VARIANT_CACHE, "https://as-cdn26.top/hls/zzz")
+    assert hit and val is None
+
+def test_v120_master_info_registers_served_entry():
+    class RM:
+        status_code = 200; text = MASTER_SAMPLE
+    addon._MASTER_CACHE.clear(); addon._HLS_KEYS.clear()
+    try:
+        with mock.patch.object(addon, "_get", return_value=RM()):
+            info = addon._master_info("https://as-cdn26.top/cdn/hls/abc/master.m3u8?md5=q&expires=9")
+        assert info and info["res"] == [720, 1080] and "hin" in info["langs"]
+        key = addon._hls_key("https://as-cdn26.top/cdn/hls/abc/master.m3u8?md5=q&expires=9")
+        assert addon._HLS_KEYS[key] == "https://as-cdn26.top/cdn/hls/abc/master.m3u8?md5=q&expires=9"
+        hit, val = addon._cache_get(addon._MASTER_CACHE,
+                                    "https://as-cdn26.top/cdn/hls/abc/master.m3u8?md5=q&expires=9")
+        assert hit and "master_text" in val and "v0.m3u8" in val["variants"]
+    finally:
+        addon._MASTER_CACHE.clear(); addon._HLS_KEYS.clear()
+
+def test_v120_cdn_never_benches_direct():
+    """An IP-bound master 403s direct (expected) — the cdn family must NOT
+    bench direct for the site family or vice versa."""
+    from test_animedekho import _reset_pool_state
+    _reset_pool_state()
+    addon._DIRECT_OK_UNTIL[0] = time.time() + 600   # site direct believed ok
+    class R403:
+        status_code = 403; text = "forbidden"
+    class R200:
+        status_code = 200; text = "#EXTM3U"
+    calls = []
+    def fake_get(url, headers=None, timeout=None, proxies=None, **kw):
+        calls.append(proxies)
+        return R403() if proxies is None else R200()
+    with mock.patch.object(addon._S, "get", side_effect=fake_get):
+        addon._FREE_POOL[0] = ["http://p:1"]
+        r = addon._get("https://as-cdn26.top/cdn/hls/abc/master.m3u8?md5=x&expires=1")
+    assert r.status_code == 200                        # served via pool exit
+    assert addon._DIRECT_OK_UNTIL[0] > time.time()     # NOT benched (cdn family)
+    _reset_pool_state()
+
+def test_v120_unrelated_host_plain_direct():
+    with mock.patch.object(addon._S, "get", return_value=_Resp(200, "{}")) as g:
+        addon._get("https://example.com/x")
+    assert "proxies" not in g.call_args.kwargs
+
+def test_v120_hls_route_regex_and_404():
+    import subprocess, sys, os, socket, time as _t
+    port = 7833
+    p = subprocess.Popen([sys.executable, "addon.py"],
+                         env=dict(os.environ, PORT=str(port)),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        for _ in range(40):
+            _t.sleep(0.25)
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
+                break
+            except OSError:
+                pass
+        code, hdrs, body = _srv_sock_request(port, "/hls/0123456789abcdef/master.m3u8", False)
+        assert code == 404                             # unknown key -> honest 404
+        code, hdrs, body = _srv_sock_request(port, "/hls/0123456789abcdef/v0.m3u8", False)
+        assert code == 404
+    finally:
+        p.terminate(); p.wait(timeout=10)

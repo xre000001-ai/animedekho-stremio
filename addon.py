@@ -30,6 +30,7 @@ RESOLVE RECIPE (all fetches are tiny HTML/JSON text)
 """
 
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -39,14 +40,14 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs, quote, unquote
+from urllib.parse import urlparse, parse_qs, quote, unquote, urljoin
 
 import requests
 
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.1.2"
+VERSION = "1.2.0"
 BRAND   = "AnimeDekho"
 PORT    = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("ADK_PUBLIC_URL", "").rstrip("/")
@@ -109,7 +110,9 @@ def _cache_get(store, key):
 _META_CACHE   = {}   # (ctype, imdb) -> (name, year)
 _SEARCH_CACHE = {}   # kw -> [(title, url, family)]
 _PAGE_CACHE   = {}   # url -> page-info dict
-_MASTER_CACHE = {}   # master url -> {"langs": [...], "res": [...]}
+_MASTER_CACHE = {}   # master url -> {"info", "master_text", "variants"}
+_HLS_KEYS      = {}   # 16-hex route key -> master url (served-playlist registry)
+_VARIANT_CACHE = {}   # variant url -> (absolutized text, expiry)
 _STREAM_CACHE = {}   # (ctype, imdb, se, ep) -> (cards, expiry)
 _STREAM_STALE = {}   # key -> (expiry, cards)   [SWR]
 _STALE_SWEEP_AT = 256
@@ -205,28 +208,39 @@ class _DeadResponse:
     def json(self):
         raise ValueError("dead response")
 
+_CDN_RE = re.compile(r"https://as-cdn\d+\.top/")
+
 def _get(url, timeout=8, referer=None):
     # plain requests (no shared-session locking): the site needs NO cookies,
     # so per-call headers on a pooled session are safe and parallel-friendly.
     # v1.1.0: site-family URLs carry the egress fallback (direct-first,
     # pool when the datacenter IP is 403-blocked).
+    # v1.2.0: three families — SITE (animedekho.app: direct-first, direct
+    # benched 10 min on 403), CDN (as-cdnN.top: direct tried but NEVER
+    # benched — ip-bound masters 403 by design while variants/segments are
+    # open, so benching would only slow the open ones down), and everything
+    # else (cinemeta/tmdb/debug urls: plain direct, no pool ever).
     hd = {"User-Agent": UA}
     if referer:
         hd["Referer"] = referer
-    if any(h in url for h in _POOL_EXEMPT):
+    fam_cdn = bool(_CDN_RE.match(url))
+    fam_site = "animedekho.app" in url
+    if not fam_cdn and not fam_site:
         return _S.get(url, headers=hd, timeout=timeout)
     now = time.time()
-    if now < _DIRECT_OK_UNTIL[0] or now >= _DIRECT_RETRY_AT[0]:
+    if fam_cdn or now < _DIRECT_OK_UNTIL[0] or now >= _DIRECT_RETRY_AT[0]:
         try:
             r = _S.get(url, headers=hd, timeout=timeout)
         except Exception:
             r = None
         if r is not None and r.status_code not in (403, 406):
-            _DIRECT_OK_UNTIL[0] = time.time() + 600
-            _DIRECT_RETRY_AT[0] = 0.0
+            if fam_site:
+                _DIRECT_OK_UNTIL[0] = time.time() + 600
+                _DIRECT_RETRY_AT[0] = 0.0
             return r
-        _DIRECT_OK_UNTIL[0] = 0.0                 # blocked / broken
-        _DIRECT_RETRY_AT[0] = time.time() + 600   # re-probe in 10 min
+        if fam_site:                               # real block signal
+            _DIRECT_OK_UNTIL[0] = 0.0
+            _DIRECT_RETRY_AT[0] = time.time() + 600   # re-probe in 10 min
     for _ in range(3):
         u = _pick_exit(time.time())
         if u is None:
@@ -467,24 +481,93 @@ def _get_video(player_url, vid):
     except Exception:
         return None
 
-def _master_info(master_url):
-    """verify + parse the master (no phantom cards). -> dict|None."""
-    hit, val = _cache_get(_MASTER_CACHE, master_url)
+def _hls_key(master_url):
+    """stable 16-hex route key for a (long, ip-bound) master url"""
+    return hashlib.md5(master_url.encode()).hexdigest()[:16]
+
+def _rewrite_master(mtext, base):
+    """v1.2.0: the CDN master is IP-BOUND to the pool exit that minted it
+    (md5+expires secure_link; verified 2026-09-11: fresh master 403s from
+    every other IP, even with Referer). Variants (as-cdn/hls/<token>, no
+    signature) and segments (/p/<token>, absolute) are OPEN cross-IP.
+
+    So we serve the master OURSELVES: every variant/audio URI is rewritten
+    to OUR /hls/{key}/vN|aN.m3u8 route. Variant playlists are relayed as
+    text (segments already absolute / absolutized) — media bytes still
+    NEVER touch this server. Same pattern as moviebox v1.9.4."""
+    lines_out, variants = [], {}
+    pending_stream = False
+    vi = ai = 0
+    for ln in mtext.splitlines():
+        s = ln.strip()
+        if s.startswith("#EXT-X-STREAM-INF:"):
+            lines_out.append(ln); pending_stream = True
+            continue
+        if pending_stream and s and not s.startswith("#"):
+            name = "v%d.m3u8" % vi; vi += 1
+            variants[name] = urljoin(base, s)
+            lines_out.append(name)
+            pending_stream = False
+            continue
+        if s.startswith("#EXT-X-MEDIA:") and "TYPE=AUDIO" in ln:
+            m = re.search(r'URI="([^"]+)"', ln)
+            if m:
+                name = "a%d.m3u8" % ai; ai += 1
+                variants[name] = urljoin(base, m.group(1))
+                ln = ln.replace(m.group(1), name)
+            lines_out.append(ln)
+            continue
+        lines_out.append(ln)
+    return "\n".join(lines_out) + "\n", variants
+
+def _variant_text(orig_url):
+    """relay one variant playlist: fetch (open cross-IP), absolutize any
+    relative media line, cache. -> text|None"""
+    hit, val = _cache_get(_VARIANT_CACHE, orig_url)
     if hit:
         return val
+    try:
+        r = _get(orig_url, timeout=12)
+    except Exception:
+        return None
+    if r.status_code != 200 or "#EXTM3U" not in r.text[:64]:
+        _cache_put(_VARIANT_CACHE, orig_url, None, _NEG_TTL)
+        return None
+    out = []
+    for ln in r.text.splitlines():
+        s = ln.strip()
+        if s and not s.startswith("#") and not s.startswith("http"):
+            ln = urljoin(orig_url, s)
+        out.append(ln)
+    text = "\n".join(out) + "\n"
+    _cache_put(_VARIANT_CACHE, orig_url, text, 45 * 60)
+    return text
+
+def _master_info(master_url):
+    """verify + parse the master (no phantom cards) AND register the
+    served-playlist entry. -> info dict | None."""
+    hit, val = _cache_get(_MASTER_CACHE, master_url)
+    if hit:
+        if val:
+            _HLS_KEYS[_hls_key(master_url)] = master_url
+        return val["info"] if val else None
     val = None
     try:
-        r = _get(master_url, timeout=8)
+        r = _get(master_url, timeout=10)
         if r.status_code == 200 and "#EXTM3U" in r.text[:64]:
             langs = sorted(set(re.findall(r'LANGUAGE="([a-z]{3})"', r.text)))
             res = sorted(set(int(x.split("x")[1])
                              for x in re.findall(r"RESOLUTION=(\d+x\d+)", r.text)))
-            val = {"langs": langs, "res": res, "audio_rends":
-                   re.findall(r'TYPE=AUDIO[^>]*LANGUAGE="([a-z]{3})"[^>]*NAME="([^"]*)"', r.text)}
+            mtext, variants = _rewrite_master(r.text, master_url)
+            val = {"info": {"langs": langs, "res": res, "audio_rends":
+                            re.findall(r'TYPE=AUDIO[^>]*LANGUAGE="([a-z]{3})"[^>]*NAME="([^"]*)"',
+                                       r.text)},
+                   "master_text": mtext, "variants": variants}
+            _HLS_KEYS[_hls_key(master_url)] = master_url
     except Exception:
         pass
     _cache_put(_MASTER_CACHE, master_url, val, _MASTER_TTL)
-    return val
+    return val["info"] if val else None
 
 # --------------------------------------------------------------------------
 # 6. card building
@@ -512,14 +595,17 @@ def _resolve_card(site_title, embed_url, ctype, se, ep, year):
         l2 = "▣ S%02dE%02d" % (se, ep)
     else:
         l2 = ("▣ %s" % year) if year else "▣ movie"
-    l3 = "▣ %s ▣ direct HLS ▣ zero-bandwidth addon" % BRAND
+    l3 = "▣ %s ▣ multi-quality HLS ▣ zero-bandwidth addon" % BRAND
     desc = l1 + "\n" + l2 + "\n" + l3
     if subs:
         desc += "\n▣ %d subtitle track" % len(subs) + ("s" if len(subs) > 1 else "")
     return {
         "name": "𖤍 %s" % site_title,
         "description": desc,
-        "url": master,                       # DIRECT — no headers needed
+        # v1.2.0: the CDN master is ip-bound to the pool exit that minted
+        # it — a direct card url would be a phantom for every user. We
+        # serve the (rewritten) master ourselves; /stream absolutizes it.
+        "url": "/hls/%s/master.m3u8" % _hls_key(master),
         "subtitles": subs,
         "behaviorHints": {"notWebReady": False, "isBingeable": True},
         "bingeGroup": "adk|%s|%s:%s:%s" % (site_title, ctype, se, ep),
@@ -846,7 +932,35 @@ class Handler(BaseHTTPRequestHandler):
             if not imdb.startswith("tt"):
                 return self._send(200, json.dumps({"streams": []}))
             res = build_streams(ctype, imdb, se, ep)
+            # v1.2.0: card urls are relative /hls/… routes — absolutize
+            # against the request host so players get a full https url
+            host = (self.headers.get("Host") or "").strip()
+            if host:
+                for c in (res.get("streams") or []):
+                    if (c.get("url") or "").startswith("/hls/"):
+                        c["url"] = "https://" + host + c["url"]
             return self._send(200, json.dumps(res))
+
+        m = re.match(r"^/hls/([a-f0-9]{16})/(master|v\d+|a\d+)\.m3u8$", path)
+        if m:
+            # v1.2.0 served-playlist routes: TEXT ONLY (master ~1-2KB,
+            # variant ~100KB gzipped to ~10KB); segments stay absolute
+            # open-CDN urls the player fetches directly — zero media bytes.
+            key, name = m.group(1), m.group(2)
+            murl = _HLS_KEYS.get(key)
+            hit, val = _cache_get(_MASTER_CACHE, murl or "")
+            if not (hit and val):
+                return self._send(404, json.dumps({"error": "expired"}))
+            if name == "master":
+                return self._send(200, val["master_text"],
+                                  "application/vnd.apple.mpegurl")
+            orig = (val["variants"] or {}).get(name)
+            if not orig:
+                return self._send(404, json.dumps({"error": "no such variant"}))
+            text = _variant_text(orig)
+            if not text:
+                return self._send(404, json.dumps({"error": "variant unavailable"}))
+            return self._send(200, text, "application/vnd.apple.mpegurl")
 
         # strict zero: nothing else is served from here — ever
         return self._send(404, json.dumps({"error": "not found"}))
