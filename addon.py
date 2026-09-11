@@ -47,7 +47,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 BRAND   = "AnimeDekho"
 PORT    = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("ADK_PUBLIC_URL", "").rstrip("/")
@@ -81,7 +81,7 @@ MANIFEST = {
                     "CDN to your player."),
     "types": ["movie", "series"],
     "resources": ["stream"],
-    "idPrefixes": ["tt"],
+    "idPrefixes": ["tt", "kitsu"],
     "catalogs": [],
 }
 
@@ -348,6 +348,26 @@ def _extract_cards(html):
         out.append({"title": t.strip(), "url": m.group(1), "family": m.group(2),
                     "year": y.group(1) if y else ""})
     return out
+
+def _kitsu_title(kid):
+    """kitsu:<id> -> (title, year) via the public kitsu.io API (v1.3.0 —
+    Stremio's anime catalogs use KITSU ids; without this the addon never
+    showed a stream in them). anime-kitsu.strem.io is dead (DNS)."""
+    hit, val = _cache_get(_META_CACHE, ("kitsu", kid))
+    if hit:
+        return val
+    val = None
+    try:
+        r = _get("https://kitsu.io/api/edge/anime/%s" % kid, timeout=6)
+        a = ((r.json() or {}).get("data") or {}).get("attributes") or {}
+        t = a.get("canonicalTitle") or (a.get("titles") or {}).get("en") \
+            or (a.get("titles") or {}).get("en_jp") or ""
+        if t:
+            val = (t, str(a.get("startDate") or "")[:4])
+            _cache_put(_META_CACHE, ("kitsu", kid), val, _META_TTL)
+    except Exception:
+        pass
+    return val
 
 def site_search(kw):
     """/?s= result cards -> [(title, url, family)] (series-hindi|movie-hindi)."""
@@ -626,7 +646,10 @@ def _match_candidates(cands, want_title, family):
     return partial[:3]
 
 def _build_inner(ctype, imdb, se, ep):
-    meta = _cinemeta(ctype, imdb)
+    if (imdb or "").startswith("kitsu:"):
+        meta = _kitsu_title(imdb.split(":", 1)[1])
+    else:
+        meta = _cinemeta(ctype, imdb)
     if not meta:
         return {"streams": [], "message": "no metadata for this id"}
     title, year = meta
@@ -923,13 +946,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(
                     {"error": "%s: %s" % (type(e).__name__, str(e)[:120])}))
 
-        m = re.match(r"^/stream/(movie|series)/(tt\d+)(?::(\d+):(\d+))?\.json$", path)
+        m = re.match(r"^/stream/(movie|series)/((?:tt\d+|kitsu:\d+))"
+                    r"(?::(\d+):(\d+))?\.json$", path)
         if m:
             ctype, imdb = m.group(1), m.group(2)
             if ctype not in ("movie", "series"):
                 return self._send(400, json.dumps({"error": "bad type"}))
             se, ep = int(m.group(3) or 1), int(m.group(4) or 1)
-            if not imdb.startswith("tt"):
+            if not (imdb.startswith("tt") or imdb.startswith("kitsu:")):
                 return self._send(200, json.dumps({"streams": []}))
             res = build_streams(ctype, imdb, se, ep)
             # v1.2.0: card urls are relative /hls/… routes — absolutize

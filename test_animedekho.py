@@ -394,7 +394,7 @@ def test_manifest_shape():
     assert m["id"] == "com.animedekho.stremio"
     assert m["resources"] == ["stream"]                  # stream-only
     assert set(m["types"]) == {"movie", "series"}
-    assert m["idPrefixes"] == ["tt"]
+    assert m["idPrefixes"] == ["tt", "kitsu"]   # v1.3.0: anime catalogs
 
 def test_no_media_routes_in_source():
     src = open("addon.py").read()
@@ -738,3 +738,84 @@ def test_v121_hls_routes_serve_seeded_entry():
     finally:
         srv.shutdown(); srv.server_close()
         addon._MASTER_CACHE.clear(); addon._HLS_KEYS.clear(); addon._VARIANT_CACHE.clear()
+
+
+# --- v1.3.0: KITSU ids (Stremio anime catalogs use kitsu: ids) -------------------
+
+KITSU_DN = {"data": {"attributes": {
+    "canonicalTitle": "Death Note", "titles": {"en": "Death Note"},
+    "subtype": "TV", "startDate": "2006-10-04"}}}
+
+def test_v130_kitsu_title_resolves():
+    class RK:
+        status_code = 200
+        text = ""
+        def json(self):
+            return KITSU_DN
+    addon._META_CACHE.clear()
+    try:
+        with mock.patch.object(addon, "_get", return_value=RK()) as g:
+            t, y = addon._kitsu_title("1376")
+        assert (t, y) == ("Death Note", "2006")
+        assert "kitsu.io/api/edge/anime/1376" in g.call_args[0][0]
+        # cached on second call (no extra fetch)
+        with mock.patch.object(addon, "_get", side_effect=AssertionError("refetch")):
+            assert addon._kitsu_title("1376") == ("Death Note", "2006")
+    finally:
+        addon._META_CACHE.clear()
+
+def test_v130_kitsu_title_falls_back_to_titles_en():
+    class RK:
+        status_code = 200
+        def json(self):
+            return {"data": {"attributes": {
+                "canonicalTitle": "", "titles": {"en": "Naruto"},
+                "startDate": "2002-10-03"}}}
+    addon._META_CACHE.clear()
+    try:
+        with mock.patch.object(addon, "_get", return_value=RK()):
+            assert addon._kitsu_title("11") == ("Naruto", "2002")
+    finally:
+        addon._META_CACHE.clear()
+
+def test_v130_build_uses_kitsu_title_not_cinemeta():
+    addon._META_CACHE.clear(); addon._SEARCH_CACHE.clear()
+    try:
+        with mock.patch.object(addon, "_kitsu_title", return_value=("Death Note", "2006")), \
+             mock.patch.object(addon, "_cinemeta", side_effect=AssertionError("cinemeta!")), \
+             mock.patch.object(addon, "search_candidates",
+                               return_value=[{"title": "Death Note",
+                                              "url": "https://animedekho.app/series-hindi/death-note/",
+                                              "family": "series-hindi", "year": "2006"}]) as sc, \
+             mock.patch.object(addon, "_resolve_card", return_value=None):
+            addon._build_inner("series", "kitsu:1376", 1, 1)
+        assert sc.call_args[0][0] == "Death Note"
+    finally:
+        addon._META_CACHE.clear(); addon._SEARCH_CACHE.clear()
+
+def test_v130_stream_route_accepts_kitsu_ids():
+    import threading
+    from http.server import ThreadingHTTPServer
+    port = 7837
+    srv = ThreadingHTTPServer(("127.0.0.1", port), addon.Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        with mock.patch.object(addon, "build_streams",
+                               return_value={"streams": [
+                                   {"name": "x", "url": "/hls/abc0123456789def/master.m3u8"}]}) as bs:
+            code, hdrs, body = _srv_sock_request(
+                port, "/stream/series/kitsu:1376:1:1.json", False)
+        assert code == 200
+        assert bs.call_args[0] == ("series", "kitsu:1376", 1, 1)
+        d = json.loads(body.decode())
+        assert d["streams"][0]["url"].startswith("https://127.0.0.1:")  # absolutized
+        assert "/hls/" in d["streams"][0]["url"]
+        # plain tt still works
+        with mock.patch.object(addon, "build_streams", return_value={"streams": []}):
+            code, hdrs, body = _srv_sock_request(port, "/stream/series/tt0877057:1:1.json", False)
+        assert code == 200
+        # junk prefixes still get an empty-but-200 answer
+        code, hdrs, body = _srv_sock_request(port, "/stream/series/xyz:1:1.json", False)
+        assert code == 404 or code == 200   # regex miss -> 404 fallthrough
+    finally:
+        srv.shutdown(); srv.server_close()
