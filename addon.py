@@ -33,6 +33,7 @@ import gzip
 import io
 import json
 import os
+import random
 import re
 import threading
 import time
@@ -45,7 +46,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 BRAND   = "AnimeDekho"
 PORT    = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("ADK_PUBLIC_URL", "").rstrip("/")
@@ -123,13 +124,131 @@ def _stale_put(key, cards):
 _S = requests.Session()
 _S.headers.update({"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
 
+# ---- v1.1.0: egress fallback pool ------------------------------------------
+# animedekho.app 403s datacenter IPs (verified 2026-09-11: /debug/search from
+# prod = 403/0 cards, same UA from other IPs = 200 + cards). Same problem
+# moviebox solved with its free-proxy pool — simplified here (no tokens,
+# plain HTML site):
+#   * direct egress is tried first and re-probed every 10 min
+#   * on 403/406 direct is benched 10 min and a free-proxy pool takes over
+#   * pool: proxyscrape public text list (http:// entries only), exits
+#     probed against the site itself, 20 usable kept, dead exits benched
+#     10 min, site-blocked exits 15 min, one good exit sticky for 90s so
+#     a resolve chain rides the SAME exit
+#   * cinemeta / TMDB are exempt (they never block us; no need to burn
+#     proxy bandwidth)
+_POOL_SRC = os.environ.get(
+    "ANIMEDEKHO_PROXY_SOURCE",
+    "https://api.proxyscrape.com/v4/free-proxy-list/get"
+    "?request=display_proxies&proxy_format=protocolipport&format=text",
+).strip()
+_POOL_EXEMPT = ("v3-cinemeta.strem.io", "api.themoviedb.org")
+_FREE_POOL = [[]]                 # alive free exits (http://ip:port)
+_POOL_BAD = {}                    # url -> benched-until ts
+_POOL_STICKY = [None, 0.0]        # last good exit, sticky-until ts
+_POOL_TS = [0.0]                  # last refresh start (throttle 4 min)
+_POOL_LOCK = threading.Lock()
+_DIRECT_OK_UNTIL = [time.time()]  # direct egress believed healthy until
+_DIRECT_RETRY_AT = [0.0]          # earliest re-probe after a block
+
+def _site_ok_via(url, timeout=5):
+    """Is this free exit usable for the site? (200 + real site content)"""
+    try:
+        r = _S.get(SITE + "/", timeout=timeout, headers={"User-Agent": UA},
+                   proxies={"http": url, "https": url})
+        return (r.status_code == 200
+                and "animedekho" in r.text[:20000].lower())
+    except Exception:
+        return False
+
+def _pool_refresh(force=False):
+    now = time.time()
+    if not force and now - _POOL_TS[0] < 240:
+        return
+    with _POOL_LOCK:
+        if now - _POOL_TS[0] < 240:            # someone refreshed meanwhile
+            return
+        _POOL_TS[0] = now
+    try:
+        r = _S.get(_POOL_SRC, timeout=20, headers={"User-Agent": UA})
+        cand = [u.strip() for u in r.text.replace("\r", "").splitlines()
+                if u.strip().startswith("http://")]
+        random.shuffle(cand)
+        cand = cand[:100]
+        good = []
+        with ThreadPoolExecutor(max_workers=20) as ex:
+            for u, ok in zip(cand, ex.map(_site_ok_via, cand)):
+                if ok:
+                    good.append(u)
+        with _POOL_LOCK:
+            prev = [u for u in _FREE_POOL[0]
+                    if _POOL_BAD.get(u, 0.0) <= time.time()]
+            merged = list(dict.fromkeys(prev + good))[:20]
+            _FREE_POOL[0] = merged or prev
+    except Exception:
+        pass
+
+def _pick_exit(now):
+    if _POOL_STICKY[0] and now < _POOL_STICKY[1]:
+        u = _POOL_STICKY[0]
+        if _POOL_BAD.get(u, 0.0) <= now:
+            return u
+    with _POOL_LOCK:
+        live = [u for u in _FREE_POOL[0] if _POOL_BAD.get(u, 0.0) <= now]
+    if not live:
+        return None
+    return random.choice(live[:8])
+
+class _DeadResponse:
+    status_code = 0
+    text = ""
+    def json(self):
+        raise ValueError("dead response")
+
 def _get(url, timeout=8, referer=None):
     # plain requests (no shared-session locking): the site needs NO cookies,
-    # so per-call headers on a pooled session are safe and parallel-friendly
+    # so per-call headers on a pooled session are safe and parallel-friendly.
+    # v1.1.0: site-family URLs carry the egress fallback (direct-first,
+    # pool when the datacenter IP is 403-blocked).
     hd = {"User-Agent": UA}
     if referer:
         hd["Referer"] = referer
-    return _S.get(url, headers=hd, timeout=timeout)
+    if any(h in url for h in _POOL_EXEMPT):
+        return _S.get(url, headers=hd, timeout=timeout)
+    now = time.time()
+    if now < _DIRECT_OK_UNTIL[0] or now >= _DIRECT_RETRY_AT[0]:
+        try:
+            r = _S.get(url, headers=hd, timeout=timeout)
+        except Exception:
+            r = None
+        if r is not None and r.status_code not in (403, 406):
+            _DIRECT_OK_UNTIL[0] = time.time() + 600
+            _DIRECT_RETRY_AT[0] = 0.0
+            return r
+        _DIRECT_OK_UNTIL[0] = 0.0                 # blocked / broken
+        _DIRECT_RETRY_AT[0] = time.time() + 600   # re-probe in 10 min
+    for _ in range(3):
+        u = _pick_exit(time.time())
+        if u is None:
+            _pool_refresh(force=True)
+            u = _pick_exit(time.time())
+            if u is None:
+                break
+        try:
+            r = _S.get(url, headers=hd, timeout=timeout,
+                       proxies={"http": u, "https": u})
+            if r.status_code in (403, 406):
+                _POOL_BAD[u] = time.time() + 900   # exit blocked by site
+            else:
+                _POOL_STICKY[0] = (u, time.time() + 90)
+                return r
+        except Exception:
+            _POOL_BAD[u] = time.time() + 600       # dead exit
+        _POOL_STICKY[0] = (None, 0.0)
+    try:                                            # last resort: direct
+        return _S.get(url, headers=hd, timeout=timeout)
+    except Exception:
+        return _DeadResponse()
 
 def _norm(t):
     return re.sub(r"[^a-z0-9]", "", (t or "").lower())
@@ -649,6 +768,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps({
                 "version": VERSION, "brand": BRAND, "uptime_s": int(time.time() - _T0),
                 "keepalive": bool(PUBLIC_URL or _KEEPALIVE_URL),
+                "egress": {"direct": time.time() < _DIRECT_OK_UNTIL[0],
+                           "pool": len(_FREE_POOL[0]),
+                           "pool_bad": len(_POOL_BAD)},
                 "caches": {k: len(v) for k, v in (
                     ("meta", _META_CACHE), ("search", _SEARCH_CACHE),
                     ("pages", _PAGE_CACHE), ("streams", _STREAM_CACHE),
@@ -702,6 +824,11 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     threading.Thread(target=_keepalive_loop, daemon=True).start()
+    # v1.1.0: warm the egress pool at boot — prod egress is site-blocked
+    # (403), so the first user request would otherwise pay the full
+    # list-fetch + probe cost (~10-30s)
+    threading.Thread(target=_pool_refresh, kwargs={"force": True},
+                     daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print("%s %s listening on :%d (strict zero-bandwidth)" % (BRAND, VERSION, PORT),
           flush=True)

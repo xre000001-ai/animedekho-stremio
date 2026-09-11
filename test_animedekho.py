@@ -486,3 +486,104 @@ def test_v101_debug_search_route_exists():
     src = open("addon.py").read()
     assert '"/debug/search"' in src
     assert "status_code" in src and "_extract_cards" in src
+
+
+# --- v1.1.0: egress fallback pool (site 403s datacenter IPs) --------------------
+
+class _Resp:
+    def __init__(self, code=200, text=""):
+        self.status_code = code
+        self.text = text
+
+def _reset_pool_state():
+    addon._FREE_POOL[0] = []
+    addon._POOL_BAD.clear()
+    addon._POOL_STICKY[0] = (None, 0.0)
+    addon._POOL_TS[0] = 0.0
+    addon._DIRECT_OK_UNTIL[0] = 0.0
+    addon._DIRECT_RETRY_AT[0] = float("inf")   # direct benched during tests
+
+def test_v110_pool_used_when_direct_blocked():
+    """Direct benched -> request rides a pool exit; a good exit becomes sticky."""
+    _reset_pool_state()
+    calls = []
+    def fake_get(url, headers=None, timeout=None, proxies=None, **kw):
+        calls.append((url, proxies))
+        if proxies is None:
+            return _Resp(403, "blocked")          # direct path (not reached)
+        if "p1" in (proxies or {}).get("http", ""):
+            return _Resp(200, "ok-via-p1")
+        raise ConnectionError("dead exit")
+    with mock.patch.object(addon._S, "get", side_effect=fake_get):
+        addon._FREE_POOL[0] = ["http://dead:1", "http://p1:2"]
+        r = addon._get("https://animedekho.app/?s=demon")
+    assert r.status_code == 200 and r.text == "ok-via-p1"
+    assert all(c[1] for c in calls)               # every attempt went via proxy
+    assert addon._POOL_STICKY[0][0] == "http://p1:2"
+    assert addon._POOL_BAD.get("http://dead:1", 0) > time.time()  # benched
+    _reset_pool_state()
+
+def test_v110_sticky_exit_reused():
+    _reset_pool_state()
+    n = [0]
+    def fake_get(url, headers=None, timeout=None, proxies=None, **kw):
+        n[0] += 1
+        return _Resp(200, "x")
+    with mock.patch.object(addon._S, "get", side_effect=fake_get):
+        addon._FREE_POOL[0] = ["http://a:1", "http://b:2"]
+        addon._POOL_STICKY[0] = ("http://b:2", time.time() + 60)
+        r1 = addon._get("https://animedekho.app/?s=one")
+        r2 = addon._get("https://animedekho.app/series-hindi/x/")
+    assert r1.status_code == r2.status_code == 200
+    assert n[0] == 2
+    # both calls rode the sticky exit
+    with mock.patch.object(addon._S, "get", side_effect=lambda *a, **k: _Resp(200, "")) as g:
+        addon._get("https://animedekho.app/?s=three")
+        assert g.call_args.kwargs["proxies"]["http"] == "http://b:2"
+    _reset_pool_state()
+
+def test_v110_exempt_hosts_stay_direct():
+    """cinemeta/TMDB never burn pool exits, even when direct is benched."""
+    _reset_pool_state()
+    with mock.patch.object(addon._S, "get", return_value=_Resp(200, "{}")) as g:
+        r = addon._get("https://v3-cinemeta.strem.io/meta/series/tt1.json")
+    assert r.status_code == 200
+    assert "proxies" not in g.call_args.kwargs
+    _reset_pool_state()
+
+def test_v110_direct_403_benches_and_falls_to_pool():
+    """First call probes direct, gets 403 -> benched, pool serves."""
+    _reset_pool_state()
+    addon._DIRECT_RETRY_AT[0] = 0.0
+    addon._DIRECT_OK_UNTIL[0] = time.time()      # believe direct is fine
+    seq = []
+    def fake_get(url, headers=None, timeout=None, proxies=None, **kw):
+        seq.append(proxies)
+        if proxies is None:
+            return _Resp(403, "dc-blocked")
+        return _Resp(200, "via-pool")
+    with mock.patch.object(addon._S, "get", side_effect=fake_get):
+        addon._FREE_POOL[0] = ["http://p:1"]
+        r = addon._get("https://animedekho.app/?s=demon")
+    assert r.text == "via-pool"
+    assert seq[0] is None and seq[1] is not None    # direct first, then pool
+    assert addon._DIRECT_OK_UNTIL[0] == 0.0         # direct benched
+    assert addon._DIRECT_RETRY_AT[0] > time.time()  # re-probe later
+    _reset_pool_state()
+
+def test_v110_pool_exhausted_falls_back_direct():
+    """No exits alive -> final attempt is plain direct (transient block?)."""
+    _reset_pool_state()
+    seen = []
+    def fake_get(url, headers=None, timeout=None, proxies=None, **kw):
+        seen.append(proxies)
+        return _Resp(200, "direct-lucky")
+    with mock.patch.object(addon._S, "get", side_effect=fake_get):
+        r = addon._get("https://animedekho.app/?s=x")
+    assert r.text == "direct-lucky"
+    assert seen[-1] is None
+    _reset_pool_state()
+
+def test_v110_health_reports_egress():
+    src = open("addon.py").read()
+    assert '"egress"' in src and "_DIRECT_OK_UNTIL" in src.split('"egress"')[1][:200]
