@@ -46,7 +46,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 BRAND   = "AnimeDekho"
 PORT    = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("ADK_PUBLIC_URL", "").rstrip("/")
@@ -800,14 +800,16 @@ class Handler(BaseHTTPRequestHandler):
             if k != "adk-dbg-9c2f" or not kw:
                 return self._send(404, json.dumps({"error": "not found"}))
             try:
-                r = _get(SITE + "/?s=" + quote(kw), timeout=10)
+                r = _get(SITE + "/?s=" + quote(kw), timeout=12)
                 cards = _extract_cards(r.text) if r.status_code == 200 else []
                 return self._send(200, json.dumps({
                     "status": r.status_code, "bytes": len(r.text),
                     "cards": len(cards),
-                    "first": [{"t": c[0][:60], "url": c[1][:70]} for c in cards[:3]]}))
+                    "first": [{"t": c["title"][:60], "url": c["url"][:70]}
+                              for c in cards[:3]]}))
             except Exception as e:
-                return self._send(200, json.dumps({"error": str(e)[:140]}))
+                return self._send(200, json.dumps(
+                    {"error": "%s: %s" % (type(e).__name__, str(e)[:120])}))
 
         m = re.match(r"^/stream/(movie|series)/(tt\d+)(?::(\d+):(\d+))?\.json$", path)
         if m:
