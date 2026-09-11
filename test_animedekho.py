@@ -700,3 +700,41 @@ def test_v120_hls_route_regex_and_404():
         assert code == 404
     finally:
         p.terminate(); p.wait(timeout=10)
+
+def test_v121_hls_routes_serve_seeded_entry():
+    """Full in-process server test: seed a served entry, hit master + a
+    variant route (this exact shape — regex group vs dict key mismatch —
+    shipped broken in v1.2.0 and the 404-only test missed it)."""
+    import threading
+    from http.server import ThreadingHTTPServer
+    murl = "https://as-cdn26.top/cdn/hls/zz/master.m3u8?md5=z&expires=7"
+    key = addon._hls_key(murl)
+    mtext, variants = addon._rewrite_master(MASTER_SAMPLE, murl)
+    addon._MASTER_CACHE.clear(); addon._HLS_KEYS.clear(); addon._VARIANT_CACHE.clear()
+    addon._cache_put(addon._MASTER_CACHE, murl,
+                     {"info": {"langs": ["hin"], "res": [720, 1080], "audio_rends": []},
+                      "master_text": mtext, "variants": variants}, 600)
+    addon._HLS_KEYS[key] = murl
+    VT = "#EXTM3U\n#EXTINF:5.0,\nhttps://as-cdn26.top/p/tok1\n"
+    class RV:
+        status_code = 200; text = VT
+    port = 7835
+    srv = ThreadingHTTPServer(("127.0.0.1", port), addon.Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        with mock.patch.object(addon, "_get", return_value=RV()):
+            code, hdrs, body = _srv_sock_request(port, "/hls/%s/master.m3u8" % key, False)
+            assert code == 200 and body.decode().startswith("#EXTM3U")
+            assert "\nv0.m3u8\n" in body.decode() and 'URI="a0.m3u8"' in body.decode()
+            assert hdrs[b"content-type"] == b"application/vnd.apple.mpegurl"
+            # THE v1.2.0 bug: name group must include .m3u8 to hit the dict
+            code, hdrs, body = _srv_sock_request(port, "/hls/%s/v0.m3u8" % key, False)
+            assert code == 200, body[:80]
+            assert "https://as-cdn26.top/p/tok1" in body.decode()
+            code, hdrs, body = _srv_sock_request(port, "/hls/%s/a0.m3u8" % key, False)
+            assert code == 200
+            code, hdrs, body = _srv_sock_request(port, "/hls/%s/v9.m3u8" % key, False)
+            assert code == 404
+    finally:
+        srv.shutdown(); srv.server_close()
+        addon._MASTER_CACHE.clear(); addon._HLS_KEYS.clear(); addon._VARIANT_CACHE.clear()

@@ -47,7 +47,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 BRAND   = "AnimeDekho"
 PORT    = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("ADK_PUBLIC_URL", "").rstrip("/")
@@ -941,12 +941,14 @@ class Handler(BaseHTTPRequestHandler):
                         c["url"] = "https://" + host + c["url"]
             return self._send(200, json.dumps(res))
 
-        m = re.match(r"^/hls/([a-f0-9]{16})/(master|v\d+|a\d+)\.m3u8$", path)
+        m = re.match(r"^/hls/([a-f0-9]{16})/((?:master|v\d+|a\d+)\.m3u8)$", path)
         if m:
             # v1.2.0 served-playlist routes: TEXT ONLY (master ~1-2KB,
             # variant ~100KB gzipped to ~10KB); segments stay absolute
             # open-CDN urls the player fetches directly — zero media bytes.
-            key, name = m.group(1), m.group(2)
+            key, name = m.group(1), m.group(2)   # name INCLUDES .m3u8
+            if name == "master.m3u8":
+                name = "master"
             murl = _HLS_KEYS.get(key)
             hit, val = _cache_get(_MASTER_CACHE, murl or "")
             if not (hit and val):
