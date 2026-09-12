@@ -49,7 +49,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 BRAND   = "AnimeDekho"
 PORT    = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("ADK_PUBLIC_URL", "").rstrip("/")
@@ -65,6 +65,10 @@ _PAGE_TTL     = 6 * 3600
 _META_TTL     = 12 * 3600
 _MASTER_TTL   = 45 * 60
 _NEG_TTL      = 300               # honest "not there" answers may be re-tried soon
+_CARD_TTL     = 40 * 60          # resolved-card cache (must stay < _MASTER_TTL
+                                 # so a cached card never outlives its relay)
+_CARD_STALE_TTL = 110 * 60       # SWR ceiling for cards
+_PREWARM_EVERY   = 10 * 60       # background warm cycle for the newest posts
 _WALL         = 20.0              # player-facing wall for one /stream build
 
 _LANG_NAME = {"jpn": "Japanese", "hin": "Hindi", "eng": "English",
@@ -83,7 +87,7 @@ MANIFEST = {
                     "CDN to your player."),
     "types": ["movie", "series"],
     "resources": ["stream"],
-    "idPrefixes": ["tt", "kitsu"],
+    "idPrefixes": ["tt", "kitsu", "anilist", "mal"],
     "catalogs": [],
 }
 
@@ -115,9 +119,32 @@ _PAGE_CACHE   = {}   # url -> page-info dict
 _MASTER_CACHE = {}   # master url -> {"info", "master_text", "variants"}
 _HLS_KEYS      = {}   # 16-hex route key -> master url (served-playlist registry)
 _VARIANT_CACHE = {}   # variant url -> (absolutized text, expiry)
+_CARD_CACHE   = {}   # (post_id, se, ep) -> card dict (movies: ep=0)
+_CARD_STALE   = {}   # key -> (expiry, card, refresh-args)      [SWR]
 _STREAM_CACHE = {}   # (ctype, imdb, se, ep) -> (cards, expiry)
 _STREAM_STALE = {}   # key -> (expiry, cards)   [SWR]
 _STALE_SWEEP_AT = 256
+
+# v1.5.0: one shared IO pool for the parallel innards (search queries run
+# together, subs race the master chain, candidates resolve concurrently)
+_IO_EX = ThreadPoolExecutor(max_workers=10, thread_name_prefix="io")
+_SUBS_EX = ThreadPoolExecutor(max_workers=4, thread_name_prefix="subs")
+_PREWARM = {"cycles": 0, "cards": 0, "posts": 0, "last": 0.0, "epis": []}
+# v1.5.0: in-memory index of the newest site posts (title/url/family).
+# A request whose title matches an indexed post skips the site search
+# entirely — with the page+card caches warm that makes a fresh-episode
+# stream request answer in milliseconds.
+_LATEST = {"posts": [], "ts": 0.0}
+_LATEST_TTL = 2 * 3600
+
+def _latest_candidates(title, family):
+    """index hit? -> candidate dicts for _match_candidates, else None."""
+    if time.time() - _LATEST["ts"] > _LATEST_TTL or not _LATEST["posts"]:
+        return None
+    out = [{"title": p["title"], "url": p["url"], "family": p["family"]}
+           for p in _LATEST["posts"]
+           if p.get("family") == family and p.get("title")]
+    return out or None
 
 def _stale_put(key, cards):
     if len(_STREAM_STALE) >= _STALE_SWEEP_AT:
@@ -157,14 +184,20 @@ _DIRECT_OK_UNTIL = [time.time()]  # direct egress believed healthy until
 _DIRECT_RETRY_AT = [0.0]          # earliest re-probe after a block
 
 def _site_ok_via(url, timeout=5):
-    """Is this free exit usable for the site? (200 + real site content)"""
+    """Usable free exit? -> (url, latency_s) or None. v1.5.0: measure the
+    latency so the pool can be ranked — _pick_exit then rides the
+    fastest exits first (a 0.6s exit vs a 3s one is the difference
+    between a 2s and an 8s cold build)."""
+    t0 = time.time()
     try:
         r = _S.get(SITE + "/", timeout=timeout, headers={"User-Agent": UA},
                    proxies={"http": url, "https": url})
-        return (r.status_code == 200
-                and "animedekho" in r.text[:20000].lower())
+        if (r.status_code == 200
+                and "animedekho" in r.text[:20000].lower()):
+            return (url, round(time.time() - t0, 3))
+        return None
     except Exception:
-        return False
+        return None
 
 def _pool_refresh(force=False):
     now = time.time()
@@ -179,16 +212,20 @@ def _pool_refresh(force=False):
         cand = [u.strip() for u in r.text.replace("\r", "").splitlines()
                 if u.strip().startswith("http://")]
         random.shuffle(cand)
-        cand = cand[:100]
+        cand = cand[:120]
         good = []
-        with ThreadPoolExecutor(max_workers=20) as ex:
-            for u, ok in zip(cand, ex.map(_site_ok_via, cand)):
-                if ok:
-                    good.append(u)
+        with ThreadPoolExecutor(max_workers=24) as ex:
+            for res in ex.map(_site_ok_via, cand):
+                if res:
+                    good.append(res)          # [(url, latency)]
+        good.sort(key=lambda x: x[1])         # fastest first
         with _POOL_LOCK:
             prev = [u for u in _FREE_POOL[0]
                     if _POOL_BAD.get(u, 0.0) <= time.time()]
-            merged = list(dict.fromkeys(prev + good))[:20]
+            pmap = {u: l for u, l in prev}
+            for u, l in good:
+                pmap[u] = min(pmap.get(u, 99.0), l)   # keep best latency
+            merged = sorted(pmap.items(), key=lambda x: x[1])[:25]
             _FREE_POOL[0] = merged or prev
     except Exception:
         pass
@@ -199,10 +236,15 @@ def _pick_exit(now):
         if _POOL_BAD.get(u, 0.0) <= now:
             return u
     with _POOL_LOCK:
-        live = [u for u in _FREE_POOL[0] if _POOL_BAD.get(u, 0.0) <= now]
+        live = [(u, l) for u, l in _FREE_POOL[0]
+                if _POOL_BAD.get(u, 0.0) <= now]
     if not live:
         return None
-    return random.choice(live[:8])
+    # v1.5.0: random among the 3 FASTEST exits (pure best-of-one would
+    # overload a single free proxy; top-3 keeps latency without the
+    # thundering herd)
+    top = [u for u, _l in live[:3]]
+    return random.choice(top) if top else live[0][0]
 
 class _DeadResponse:
     status_code = 0
@@ -446,6 +488,77 @@ def _season_for_ep(eps, se, ep, season_index):
     return None
 
 
+# ---- v1.5.0: AniList / MAL ids -------------------------------------------
+# Stremio anime catalogs also exist with anilist:/mal: ids — one cached
+# GraphQL call resolves either to (title, year), titles.english first
+# (same romaji-vs-English lesson as kitsu). Season entries get the same
+# franchise-count index via AniList search (TV format, startDate-sorted).
+_ANILIST_GQL = "https://graphql.anilist.co"
+
+def _anilist_title(qid, idmal=False):
+    key = ("al", ("mal" if idmal else "an"), str(qid))
+    hit, val = _cache_get(_META_CACHE, key)
+    if hit:
+        return val
+    val = None
+    try:
+        gql = ("query($id:Int,$mal:Int){Media(id:$id,idMal:$mal,type:ANIME)"
+               "{id format title{english romaji} startDate{year}}}")
+        var = {"mal": int(qid)} if idmal else {"id": int(qid)}
+        r = _S.post(_ANILIST_GQL, json={"query": gql, "variables": var},
+                    headers={"User-Agent": UA}, timeout=8)
+        m = ((r.json() or {}).get("data") or {}).get("Media") or {}
+        t = (m.get("title") or {}).get("english") or (m.get("title") or {}).get("romaji") or ""
+        if t:
+            val = (t, str((m.get("startDate") or {}).get("year") or ""))
+            _cache_put(_META_CACHE, key, val, _META_TTL)
+            if m.get("id"):        # mal -> anilist id bridge for season index
+                _cache_put(_META_CACHE, ("alid", str(qid)),
+                           str(m["id"]), _META_TTL)
+    except Exception:
+        pass
+    return val
+
+def _anilist_season_index(qid, idmal=False):
+    """1-based season index via same-franchise TV entries, startDate-sorted
+    (kitsu _kitsu_season_index pattern, AniList flavour)."""
+    key = ("alseas", ("mal" if idmal else "an"), str(qid))
+    hit, val = _cache_get(_META_CACHE, key)
+    if hit:
+        return val
+    idx = None
+    try:
+        meta = _anilist_title(qid, idmal)
+        mine = None
+        if meta:
+            gql = ("query($s:String){Page(perPage:20){media(search:$s,"
+                   "type:ANIME,format:TV,sort:START_DATE_ASC)"
+                   "{id startDate{year month day}}}}")
+            base = _season_stripped(meta[0]).split()
+            q = " ".join(base[:2]) if len(base) >= 2 else (base[0] if base else "")
+            if q:
+                r = _S.post(_ANILIST_GQL,
+                            json={"query": gql, "variables": {"s": q}},
+                            headers={"User-Agent": UA}, timeout=8)
+                rows = ((((r.json() or {}).get("data") or {})
+                         .get("Page") or {}).get("media")) or []
+                n = 0
+                mine = str(qid)
+                if idmal:
+                    _hit, _alid = _cache_get(_META_CACHE, ("alid", str(qid)))
+                    mine = _alid if (_hit and _alid) else None
+                if mine:
+                    for a in rows:
+                        n += 1
+                        if str(a.get("id")) == mine:
+                            idx = n
+                            break
+    except Exception:
+        idx = None
+    _cache_put(_META_CACHE, key, idx, _META_TTL if idx else _NEG_TTL)
+    return idx
+
+
 def site_search(kw):
     """/?s= result cards -> [(title, url, family)] (series-hindi|movie-hindi)."""
     key = kw.strip().lower()
@@ -464,8 +577,12 @@ def site_search(kw):
 
 def search_candidates(title):
     """The site search word-ANDs, so long official titles can miss. Try the
-    full title first, then progressively shorter prefixes (results merged;
-    every step is cached)."""
+    full title plus progressively shorter prefixes (results merged; every
+    step is cached).
+    v1.5.0: all queries fire CONCURRENTLY — sequential prefixes cost
+    3-4 proxied roundtrips (~1.5s each) on the cold path; now the wall
+    time is one roundtrip. Merge order keeps the full-title answer first
+    so matching tiers still see the best candidates first."""
     seen, out = set(), []
     words = re.sub(r"[^\w\s]", " ", title).split()
     queries = [title]
@@ -475,14 +592,19 @@ def search_candidates(title):
         queries.append(" ".join(words[:2]))
     if words and len(words[0]) >= 4:
         queries.append(words[0])
-    for q in queries:
-        for c in site_search(q):
-            k = c["url"]
-            if k not in seen:
-                seen.add(k)
+    uniq = list(dict.fromkeys(queries))[:4]
+    if len(uniq) == 1:
+        for c in site_search(uniq[0]):
+            if c["url"] not in seen:
+                seen.add(c["url"])
                 out.append(c)
-        if out and q == title:        # full title already answered
-            break
+        return out
+    results = list(_IO_EX.map(site_search, uniq))
+    for q, cands in zip(uniq, results):
+        for c in cands or []:
+            if c["url"] not in seen:
+                seen.add(c["url"])
+                out.append(c)
     return out
 
 def _parse_series_page(url):
@@ -683,19 +805,56 @@ def _master_info(master_url):
 # --------------------------------------------------------------------------
 # 6. card building
 # --------------------------------------------------------------------------
-def _resolve_card(site_title, embed_url, ctype, se, ep, year):
-    """One candidate -> one stream card (direct master, direct subs)."""
+def _card_refresh(site_title, embed_url, ctype, se, ep, year):
+    """SWR for the card cache: re-resolve in the background, in-place."""
+    try:
+        _resolve_card(site_title, embed_url, ctype, se, ep, year,
+                      force=True)
+    except Exception:
+        pass
+
+def _resolve_card(site_title, embed_url, ctype, se, ep, year,
+                  force=False, deadline=None):
+    """One candidate -> one stream card (direct master, direct subs).
+    v1.5.0: (a) resolved cards are cached by (post_id, se, ep) with SWR —
+    an imdb request, a kitsu request and a prewarm cycle for the same
+    episode share ONE resolution; (b) subtitles race the master chain
+    instead of running after it; (c) deadline-aware: subs are skipped
+    when the player-facing wall is about to hit."""
+    ckey = (embed_url.rsplit("/", 1)[-1], se, ep)
+    if not force:
+        hit, card = _cache_get(_CARD_CACHE, ckey)
+        if hit:
+            return card
+        ent = _CARD_STALE.get(ckey)
+        if ent and ent[0] > time.time() and ent[1]:
+            threading.Thread(target=_card_refresh,
+                             args=(site_title, embed_url, ctype, se, ep,
+                                   year), daemon=True).start()
+            return ent[1]
     got = _embed_iframe(embed_url)
     if not got:
+        if not force:                  # cache honest misses briefly too
+            _cache_put(_CARD_CACHE, ckey, None, _NEG_TTL)
         return None
     player_url, vid = got
+    if deadline is None:
+        deadline = time.time() + 12
+    f_subs = _SUBS_EX.submit(_player_subs, player_url)
     master = _get_video(player_url, vid)
     if not master:
+        if not force:
+            _cache_put(_CARD_CACHE, ckey, None, _NEG_TTL)
         return None
     info = _master_info(master)
     if not info:                       # dead/unverified link -> no card
+        if not force:
+            _cache_put(_CARD_CACHE, ckey, None, _NEG_TTL)
         return None
-    subs = _player_subs(player_url)
+    try:
+        subs = f_subs.result(timeout=max(0.5, deadline - time.time()))
+    except Exception:
+        subs = []
     langs = [l for l in info["langs"] if _LANG_NAME.get(l, l)]
     l1 = "▣ %dp" % max(info["res"]) if info["res"] else "▣ MULTI"
     if info["res"] and len(info["res"]) > 1:
@@ -710,7 +869,7 @@ def _resolve_card(site_title, embed_url, ctype, se, ep, year):
     desc = l1 + "\n" + l2 + "\n" + l3
     if subs:
         desc += "\n▣ %d subtitle track" % len(subs) + ("s" if len(subs) > 1 else "")
-    return {
+    card = {
         "name": "𖤍 %s" % site_title,
         "description": desc,
         # v1.2.0: the CDN master is ip-bound to the pool exit that minted
@@ -721,6 +880,14 @@ def _resolve_card(site_title, embed_url, ctype, se, ep, year):
         "behaviorHints": {"notWebReady": False, "isBingeable": True},
         "bingeGroup": "adk|%s|%s:%s:%s" % (site_title, ctype, se, ep),
     }
+    if card:                           # fresh success -> cache + SWR entry
+        _cache_put(_CARD_CACHE, ckey, card, _CARD_TTL)
+        if len(_CARD_STALE) >= _STALE_SWEEP_AT:
+            now = time.time()
+            for k in [k for k, e in _CARD_STALE.items() if e[0] < now]:
+                _CARD_STALE.pop(k, None)
+        _CARD_STALE[ckey] = (time.time() + _CARD_STALE_TTL, card)
+    return card
 
 _GENERIC_TOK = {"the", "movie", "film", "official", "camrip", "dub", "dubbed",
                 "sub", "subbed", "hindi", "english", "japanese", "season",
@@ -767,9 +934,29 @@ def _match_candidates(cands, want_title, family):
                 and _tokens(_clean_title(c["title"])) <= wtok]
         if subs:
             return subs[:3]
+    # v1.5.0 fuzzy last resort: the site occasionally renames a little
+    # ('Kaiju No 8' vs 'Kaiju No. 8 — The Third Wave'). Only when every
+    # other tier failed, same family, ratio >= 0.90 on the folded norms —
+    # conservative enough that a wrong franchise answer stays unlikely.
+    if len(want) >= 8:
+        import difflib
+        best, best_r = [], 0.0
+        for c in fam:
+            cn = _norm(_clean_title(c["title"]))
+            if abs(len(cn) - len(want)) > max(6, len(want) // 2):
+                continue
+            r = difflib.SequenceMatcher(None, want, cn).ratio()
+            if r > best_r:
+                best, best_r = [c], r
+            elif r == best_r and best:
+                best.append(c)
+        if best_r >= 0.90:
+            return best[:3]
     return []
 
-def _build_inner(ctype, imdb, se, ep):
+def _build_inner(ctype, imdb, se, ep, deadline=None):
+    if deadline is None:
+        deadline = time.time() + _WALL
     season_index = None
     if (imdb or "").startswith("kitsu:"):
         kid = imdb.split(":", 1)[1]
@@ -782,6 +969,15 @@ def _build_inner(ctype, imdb, se, ep):
             if base and base != meta[0]:
                 season_index = _kitsu_season_index(kid)
                 meta = (base, meta[1])
+    elif (imdb or "").startswith("anilist:") or (imdb or "").startswith("mal:"):
+        kid = imdb.split(":", 1)[1]
+        meta = _anilist_title(kid, idmal=imdb.startswith("mal:"))
+        if meta:
+            base = _season_stripped(meta[0])
+            if base and base != meta[0]:
+                season_index = _anilist_season_index(
+                    kid, idmal=imdb.startswith("mal:"))
+                meta = (base, meta[1])
     else:
         meta = _cinemeta(ctype, imdb)
     if not meta:
@@ -790,40 +986,63 @@ def _build_inner(ctype, imdb, se, ep):
     # v1.4.1: disambiguation parens ('Ranma ½ (2024)', '(TV)') never
     # appear on the site — strip them or exact matching breaks
     title = re.sub(r"\s*\((?:19|20)\d{2}\)\s*$|\s*\(TV\)\s*$", "", title).strip()
-    cands = search_candidates(title)
+    fam_want = ("series-hindi" if ctype == "series" else "movie-hindi")
+    # v1.5.0 index-first: the newest posts answer from RAM (no site
+    # search at all). The index ONLY holds ~10 fresh posts though, so a
+    # title that doesn't match any of them falls through to the real
+    # site search — old titles keep working exactly as before.
+    cands = _latest_candidates(title, fam_want)
+    matched = _match_candidates(cands, title, fam_want) if cands else []
+    if not matched:
+        cands = search_candidates(title)
+        matched = _match_candidates(cands, title, fam_want)
     if not cands:
         return {"streams": [], "message": "not on %s (search empty)" % BRAND}
+    # v1.5.0: candidates resolve CONCURRENTLY (pages + embed chains in
+    # parallel) and the whole build is deadline-aware — when the wall is
+    # about to hit we return whatever cards already landed instead of a
+    # "slow, tap again" message.
     if ctype == "series":
-        matched = _match_candidates(cands, title, "series-hindi")
-        cards = []
-        for c in matched:
+
+        def _one_series(c):
             pg = _parse_series_page(c["url"])
             if not pg:
-                continue
+                return None
             ss = _season_for_ep(pg["eps"], se, ep, season_index)
             if ss is None:
-                continue                     # this page simply lacks the episode
-            name = pg["title"] or c["title"]
-            if len(matched) > 1 and cards:
-                name += " · alt"
-            card = _resolve_card(name,
-                                 SITE + "/embed/%s/%d-%d" % (pg["post_id"], ss, ep),
-                                 ctype, ss, ep, year)
-            if card:
-                cards.append(card)
+                return None                 # this page simply lacks the episode
+            return _resolve_card(
+                pg["title"] or c["title"],
+                SITE + "/embed/%s/%d-%d" % (pg["post_id"], ss, ep),
+                ctype, ss, ep, year, deadline=deadline)
+
+        worker = _one_series
     else:
-        matched = _match_candidates(cands, title, "movie-hindi")
-        cards = []
-        for c in matched:
+
+        def _one_movie(c):
             pg = _parse_movie_page(c["url"])
             if not pg:
-                continue
-            name = pg["title"] or c["title"]
-            if len(matched) > 1 and cards:
-                name += " · alt"
-            card = _resolve_card(name, pg["embed"], ctype, 1, 1, year)
+                return None
+            return _resolve_card(pg["title"] or c["title"], pg["embed"],
+                                 ctype, 1, 1, year, deadline=deadline)
+
+        worker = _one_movie
+    cards = []
+    if matched:
+        futs = [_IO_EX.submit(worker, c) for c in matched[:3]]
+        for f in futs:
+            try:
+                card = f.result(timeout=max(0.2, deadline - time.time()))
+            except Exception:
+                card = None
             if card:
                 cards.append(card)
+            if time.time() >= deadline:
+                for f2 in futs:
+                    f2.cancel()
+                break
+    for i in range(1, len(cards)):          # name the extras as alternates
+        cards[i]["name"] += " · alt"
     if not cards:
         if matched:
             return {"streams": [], "message":
@@ -849,7 +1068,8 @@ def build_streams(ctype, imdb, se, ep):
                                      args=(ctype, imdb, se, ep, key),
                                      daemon=True).start()
         return {"streams": stale[1]}
-    fut = _BUILD_EX.submit(_build_inner, ctype, imdb, se, ep)
+    fut = _BUILD_EX.submit(_build_inner, ctype, imdb, se, ep,
+                         time.time() + _WALL)
     try:
         res = fut.result(timeout=_WALL)
     except FuturesTimeoutError:
@@ -908,6 +1128,100 @@ def _keepalive_loop():
             except Exception:
                 pass
         time.sleep(240)
+
+# --------------------------------------------------------------------------
+# 7.5 prewarm (v1.5.0) — the newest episodes are hot before anyone asks
+# --------------------------------------------------------------------------
+# Cold-path anatomy (prod): every site-family fetch rides a free proxy
+# (~1-2.5s each) — search + page + embed + subs made first-touch builds
+# 5-15s. The fixes: parallel innards (above) plus THIS background cycle —
+# every ~10 min it scrapes /category/hindi-dub/ (WordPress date-ordered,
+# server-rendered), parses the newest series/movie posts and resolves the
+# newest episodes. All the shared caches (search, page, CARD, master)
+# fill from the same keys a real request uses, so when a user opens a
+# fresh episode the answer is a chain of cache hits (<300ms).
+_LATEST_RE = re.compile(
+    r'href="(https://animedekho\.app/(series-hindi|movie-hindi)/([a-z0-9-]+))/?[^a-z0-9-]')
+
+def _prewarm_cycle():
+    try:
+        r = _get(SITE + "/category/hindi-dub/", timeout=15)
+        if r.status_code != 200:
+            return
+        posts, seen = [], set()
+        for _u, fam, slug in _LATEST_RE.findall(r.text):
+            if slug in seen:
+                continue
+            seen.add(slug)
+            posts.append((fam, slug))
+        _PREWARM["posts"] = len(posts)
+        n_cards = 0
+        epis = []
+        index = []
+        # newest series first (the list is date-ordered): parse every
+        # post (index + page cache), resolve cards for the newest 6
+        # series + 2 movies; older posts in the list stay index-only
+        n_series = 0
+        for fam, slug in posts:
+            url = "%s/%s/%s/" % (SITE, fam, slug)
+            try:
+                if fam == "series-hindi":
+                    pg = _parse_series_page(url)
+                    if not pg or not pg["eps"]:
+                        continue
+                    if pg["title"]:
+                        index.append({"title": pg["title"], "url": url,
+                                      "family": "series-hindi"})
+                    if n_series >= 6 or n_cards >= 8:
+                        continue                # indexed, not card-warmed
+                    n_series += 1
+                    ss, ee = max(pg["eps"])   # newest episode of this post
+                    # a post can hold several seasons: warm the newest ep
+                    # of the newest TWO seasons (returning viewers + new)
+                    targets = {(ss, ee)}
+                    if ss > 1:
+                        targets.add((ss - 1, max(e2 for (s2, e2) in pg["eps"]
+                                                 if s2 == ss - 1)))
+                    for (s2, e2) in sorted(targets, reverse=True)[:2]:
+                        if _resolve_card(pg["title"] or slug,
+                                         SITE + "/embed/%s/%d-%d"
+                                         % (pg["post_id"], s2, e2),
+                                         "series", s2, e2, ""):
+                            n_cards += 1
+                            epis.append("%s %dx%d" % (slug[:22], s2, e2))
+                        if pg["title"]:
+                            site_search(_season_stripped(pg["title"]))
+                else:
+                    pg = _parse_movie_page(url)
+                    if not pg:
+                        continue
+                    if pg["title"]:
+                        index.append({"title": pg["title"], "url": url,
+                                      "family": "movie-hindi"})
+                    if n_cards >= 8 or (n_series >= 6 and n_cards >= 4):
+                        continue                # indexed, not card-warmed
+                    if _resolve_card(pg["title"] or slug, pg["embed"],
+                                     "movie", 1, 1, ""):
+                        n_cards += 1
+                        epis.append(slug[:24])
+            except Exception:
+                continue
+        if index:
+            _LATEST["posts"] = index
+            _LATEST["ts"] = time.time()
+        _PREWARM["cycles"] += 1
+        _PREWARM["cards"] += n_cards
+        _PREWARM["last"] = time.time()
+        _PREWARM["epis"] = epis[:8]
+    except Exception:
+        pass
+
+def _prewarm_loop():
+    time.sleep(90)                     # let the pool warm first
+    while True:
+        _prewarm_cycle()
+        time.sleep(_PREWARM_EVERY + random.randint(0, 90))
+
 
 # --------------------------------------------------------------------------
 # 8. http server — JSON only, gzip, CORS
@@ -1023,7 +1337,14 @@ class Handler(BaseHTTPRequestHandler):
                 "caches": {k: len(v) for k, v in (
                     ("meta", _META_CACHE), ("search", _SEARCH_CACHE),
                     ("pages", _PAGE_CACHE), ("streams", _STREAM_CACHE),
-                    ("stale", _STREAM_STALE), ("masters", _MASTER_CACHE))},
+                    ("stale", _STREAM_STALE), ("masters", _MASTER_CACHE),
+                    ("cards", _CARD_CACHE))},
+                "prewarm": {"cycles": _PREWARM["cycles"],
+                            "cards": _PREWARM["cards"],
+                            "posts": _PREWARM["posts"],
+                            "last_ago_s": int(time.time() - _PREWARM["last"])
+                            if _PREWARM["last"] else None,
+                            "episodes": _PREWARM["epis"]},
                 "reqlog_len": len(_REQLOG)}))
 
         if path == "/" or path == "/install":
@@ -1084,14 +1405,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(
                     {"error": "%s: %s" % (type(e).__name__, str(e)[:120])}))
 
-        m = re.match(r"^/stream/(movie|series)/((?:tt\d+|kitsu:\d+))"
+        m = re.match(r"^/stream/(movie|series)/"
+                    r"((?:tt\d+|kitsu:\d+|anilist:\d+|mal:\d+))"
                     r"(?::(\d+):(\d+))?\.json$", path)
         if m:
             ctype, imdb = m.group(1), m.group(2)
             if ctype not in ("movie", "series"):
                 return self._send(400, json.dumps({"error": "bad type"}))
             se, ep = int(m.group(3) or 1), int(m.group(4) or 1)
-            if not (imdb.startswith("tt") or imdb.startswith("kitsu:")):
+            if not (imdb.startswith("tt") or imdb.startswith("kitsu:")
+                    or imdb.startswith("anilist:")
+                    or imdb.startswith("mal:")):
                 return self._send(200, json.dumps({"streams": []}))
             res = build_streams(ctype, imdb, se, ep)
             # v1.2.0: card urls are relative /hls/… routes — absolutize
@@ -1137,6 +1461,7 @@ def main():
     # list-fetch + probe cost (~10-30s)
     threading.Thread(target=_pool_refresh, kwargs={"force": True},
                      daemon=True).start()
+    threading.Thread(target=_prewarm_loop, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print("%s %s listening on :%d (strict zero-bandwidth)" % (BRAND, VERSION, PORT),
           flush=True)
