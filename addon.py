@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 BRAND   = "AnimeDekho"
 ADDON_NAME = "ΛNIME | VERSE"      # v1.7.0 user-named brand
 ADDON_LOGO = "https://i.postimg.cc/pXvhmfg1/Chat-GPT-Image-Sep-12-2026-11-32-08-AM.png"
