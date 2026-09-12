@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 BRAND   = "AnimeDekho"
 PORT    = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("ADK_PUBLIC_URL", "").rstrip("/")
@@ -1038,8 +1038,8 @@ def _resolve_trservers(site_title, tr_servers, post_id, year,
     # v1.6.1: own minimum budget — the trdekho pages are site-family
     # (pool-proxied on prod, several seconds each), so a caller passing
     # a nearly-spent build wall must not starve this chain.
-    if deadline is None or deadline < time.time() + 14:
-        deadline = time.time() + 14
+    if deadline is None or deadline < time.time() + 18:
+        deadline = time.time() + 18
 
     def _iframe(u):
         try:
