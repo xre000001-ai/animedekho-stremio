@@ -394,7 +394,7 @@ def test_manifest_shape():
     assert m["id"] == "com.animedekho.stremio"
     assert m["resources"] == ["stream"]                  # stream-only
     assert set(m["types"]) == {"movie", "series"}
-    assert m["idPrefixes"] == ["tt", "kitsu"]   # v1.3.0: anime catalogs
+    assert m["idPrefixes"] == ["tt", "kitsu", "anilist", "mal"]  # v1.4.0: +anilist/mal
 
 def test_no_media_routes_in_source():
     src = open("addon.py").read()

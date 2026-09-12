@@ -29,6 +29,7 @@ RESOLVE RECIPE (all fetches are tiny HTML/JSON text)
     stale-served max 90min while a refresh runs behind the curtain.
 """
 
+import base64
 import gzip
 import hashlib
 import html as _html
@@ -49,7 +50,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 BRAND   = "AnimeDekho"
 PORT    = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("ADK_PUBLIC_URL", "").rstrip("/")
@@ -71,7 +72,11 @@ _CARD_STALE_TTL = 110 * 60       # SWR ceiling for cards
 _PREWARM_EVERY   = 10 * 60       # background warm cycle for the newest posts
 _WALL         = 20.0              # player-facing wall for one /stream build
 
-_LANG_NAME = {"jpn": "Japanese", "hin": "Hindi", "eng": "English",
+# v1.6.0: trdekho players (vidmoly) use ISO 639-1 two-letter codes
+_LANG_NAME = {"hi": "Hindi", "en": "English", "ja": "Japanese",
+              "te": "Telugu", "ta": "Tamil", "kn": "Kannada",
+              "ml": "Malayalam", "mr": "Marathi", "bn": "Bangla",
+              "jpn": "Japanese", "hin": "Hindi", "eng": "English",
               "tel": "Telugu", "tam": "Tamil", "kan": "Kannada",
               "mal": "Malayalam", "mar": "Marathi", "ben": "Bangla",
               "und": "", "": ""}
@@ -253,6 +258,11 @@ class _DeadResponse:
         raise ValueError("dead response")
 
 _CDN_RE = re.compile(r"https://as-cdn\d+\.top/")
+# v1.6.0: trdekho player-host families — same egress treatment as the
+# site itself (direct-first, pool only on a real 403 block)
+_PLAYER_HOSTS = ("vidmoly.biz", "vidmoly.me", "vidmoly.host",
+                 "emturbovid.com", "turboviplay.com", "vmnow.online",
+                 "abyssplayer.com", "xerver.xyz", "rubystm.com", "upns.one")
 
 def _get(url, timeout=8, referer=None):
     # plain requests (no shared-session locking): the site needs NO cookies,
@@ -268,7 +278,8 @@ def _get(url, timeout=8, referer=None):
     if referer:
         hd["Referer"] = referer
     fam_cdn = bool(_CDN_RE.match(url))
-    fam_site = "animedekho.app" in url
+    fam_site = ("animedekho.app" in url
+               or any(h in url for h in _PLAYER_HOSTS))
     if not fam_cdn and not fam_site:
         return _S.get(url, headers=hd, timeout=timeout)
     now = time.time()
@@ -660,11 +671,33 @@ def _parse_movie_page(url):
                 except Exception:
                     pass
         t = re.search(r'<h1 class="entry-title">([^<]*)</h1>', h)
-        if not m:
+        # v1.6.0: NEW movie posts (e.g. 'The Ribbon Hero') hide their
+        # players in base64 data-(src|url|link) attributes, each decoding
+        # to /?trdekho={0-8}&trid={postid}&trtype=1 — a multi-server
+        # grid. Collect every one (dedup, order-preserving).
+        tr_servers = []
+        for b64 in re.findall(r'data-(?:src|url|link)="([A-Za-z0-9+/=]{16,})"', h):
+            try:
+                d = base64.b64decode(b64).decode("utf-8", "ignore")
+            except Exception:
+                continue
+            if "trdekho=" in d:
+                tr_servers.append(d if d.startswith("http")
+                                  else urljoin(SITE + "/", d))
+        tr_servers = list(dict.fromkeys(tr_servers))
+        if not m and not tr_servers:
             val = None
         else:
-            val = {"post_id": m.group(1),
-                   "embed": SITE + "/embed/" + m.group(1),
+            trid = ""
+            if tr_servers:
+                mt = re.search(r"[?&]trid=(\d+)", tr_servers[0])
+                if mt:
+                    trid = mt.group(1)
+            # v1.6.0: BOTH patterns can coexist (death-note relight has
+            # embed + tr_servers); no embed at all -> post_id = trid
+            val = {"post_id": m.group(1) if m else trid,
+                   "embed": (SITE + "/embed/" + m.group(1)) if m else None,
+                   "tr_servers": tr_servers,
                    "title": _html.unescape(t.group(1).strip()) if t else ""}
         _cache_put(_PAGE_CACHE, url, val, _PAGE_TTL if val else _NEG_TTL)
         return val
@@ -788,12 +821,12 @@ def _master_info(master_url):
     try:
         r = _get(master_url, timeout=10)
         if r.status_code == 200 and "#EXTM3U" in r.text[:64]:
-            langs = sorted(set(re.findall(r'LANGUAGE="([a-z]{3})"', r.text)))
+            langs = sorted(set(re.findall(r'LANGUAGE="([a-z]{2,3})"', r.text)))
             res = sorted(set(int(x.split("x")[1])
                              for x in re.findall(r"RESOLUTION=(\d+x\d+)", r.text)))
             mtext, variants = _rewrite_master(r.text, master_url)
             val = {"info": {"langs": langs, "res": res, "audio_rends":
-                            re.findall(r'TYPE=AUDIO[^>]*LANGUAGE="([a-z]{3})"[^>]*NAME="([^"]*)"',
+                            re.findall(r'TYPE=AUDIO[^>]*LANGUAGE="([a-z]{2,3})"[^>]*NAME="([^"]*)"',
                                        r.text)},
                    "master_text": mtext, "variants": variants}
             _HLS_KEYS[_hls_key(master_url)] = master_url
@@ -821,7 +854,13 @@ def _resolve_card(site_title, embed_url, ctype, se, ep, year,
     episode share ONE resolution; (b) subtitles race the master chain
     instead of running after it; (c) deadline-aware: subs are skipped
     when the player-facing wall is about to hit."""
-    ckey = (embed_url.rsplit("/", 1)[-1], se, ep)
+    # v1.6.0 FIX (regressed in v1.5.0): series embed URLs end in
+    # '/embed/{post}/{se}-{ep}' — the old rsplit key was just '{se}-{ep}',
+    # colliding across ALL series (a cached Solo Leveling 2x1 answered
+    # Dandadan 2x1 requests!). Key on the numeric POST id instead.
+    _mk = re.search(r"/embed/(\d+)", embed_url or "")
+    ckey = (_mk.group(1) if _mk else (embed_url or "?").rsplit("/", 1)[-1],
+            se, ep)
     if not force:
         hit, card = _cache_get(_CARD_CACHE, ckey)
         if hit:
@@ -888,6 +927,168 @@ def _resolve_card(site_title, embed_url, ctype, se, ep, year,
                 _CARD_STALE.pop(k, None)
         _CARD_STALE[ckey] = (time.time() + _CARD_STALE_TTL, card)
     return card
+
+# --------------------------------------------------------------------------
+# 6b. v1.6.0 trdekho multi-server engine (new movie posts)
+# --------------------------------------------------------------------------
+def _player_master(player_url):
+    """player iframe url -> (master_url, subs) | (None, None).
+    Dispatch: as-cdnN.top keeps the v1.2.0 getVideo POST chain; vidmoly
+    embeds carry the signed master LITERALLY in the page (12h token,
+    absolute variant/audio urls — open cross-IP) + srt.vidmoly.me subs;
+    emturbovid carries a tokenless turboviplay master literally. The
+    other trdekho hosts (abyssplayer, xerver, rubystm, upns,
+    filesforever) assemble sources at runtime behind anti-debug checks —
+    honest skip until cracked."""
+    try:
+        if _CDN_RE.match(player_url):
+            vid = player_url.split("/video/")[-1]
+            return _get_video(player_url, vid), []
+        if "vidmoly" in player_url:
+            r = _get(player_url, timeout=8, referer=SITE + "/")
+            m = re.search(r'(https://[^\s"\'\\]+\.m3u8\?[^\s"\'\\]+)',
+                          r.text or "")
+            if not m:
+                return None, None
+            subs = []
+            for label, su in re.findall(
+                    r'playerjs\w*[Ss]ubtitle\w*\s*=\s*"\[([^\]]+)\](https?://[^"]+)"',
+                    r.text or ""):
+                lang = "eng" if "eng" in label.lower() else _norm(label)[:3]
+                subs.append({"url": su, "lang": lang or "eng",
+                             "id": "vm-" + (lang or "eng")})
+            if not subs:
+                su = re.search(r'(https?://srt\.vidmoly\.me/[^\s"\'\\]+\.vtt)',
+                               r.text or "")
+                if su:
+                    subs.append({"url": su.group(1), "lang": "eng",
+                                 "id": "vm-eng"})
+            return m.group(1), subs
+        if "emturbovid" in player_url or "turboviplay" in player_url:
+            r = _get(player_url, timeout=8, referer=SITE + "/")
+            m = re.search(r'(https://cdn\d+\.turboviplay\.com/[^\s"\'\\]+\.m3u8)',
+                          r.text or "")
+            return (m.group(1), []) if m else (None, None)
+        return None, None
+    except Exception:
+        return None, None
+
+_TR_FAM_TAG = (("vidmoly", "vidmoly"), ("emturbovid", "emturbo"),
+               ("turboviplay", "emturbo"), ("as-cdn", "cdn"))
+_TR_PRIO = {"vidmoly": 0, "emturbo": 1, "cdn": 2}
+
+def _tr_fam_tag(u):
+    for k, v in _TR_FAM_TAG:
+        if k in u:
+            return v
+    return None
+
+def _card_from_master(site_title, fam, master, subs, year):
+    """verified master -> one stream card ('NAME · fam' style)."""
+    info = _master_info(master)
+    if not info:
+        return None
+    langs = [l for l in info["langs"] if _LANG_NAME.get(l, l)]
+    l1 = "\u25a3 %dp" % max(info["res"]) if info["res"] else "\u25a3 MULTI"
+    if info["res"] and len(info["res"]) > 1:
+        l1 += " \u25a3 %d\u2013%dp multi-quality" % (min(info["res"]), max(info["res"]))
+    if langs:
+        l1 += " \u25a3 %s audio" % "/".join(_LANG_NAME.get(l, l) for l in langs[:5])
+    l2 = ("\u25a3 %s" % year) if year else "\u25a3 movie"
+    l3 = "\u25a3 %s \u25a3 multi-quality HLS \u25a3 zero-bandwidth addon" % BRAND
+    desc = l1 + "\n" + l2 + "\n" + l3
+    if subs:
+        desc += "\n\u25a3 %d subtitle track" % len(subs) + ("s" if len(subs) > 1 else "")
+    return {
+        "name": "𖤍 %s \u00b7 %s" % (site_title, fam),
+        "description": desc,
+        "url": "/hls/%s/master.m3u8" % _hls_key(master),
+        "subtitles": subs,
+        "behaviorHints": {"notWebReady": False, "isBingeable": True},
+        "bingeGroup": "adk|%s|%s" % (site_title, fam),
+    }
+
+def _tr_refresh(site_title, tr_servers, post_id, year):
+    try:
+        _resolve_trservers(site_title, tr_servers, post_id, year,
+                           force=True)
+    except Exception:
+        pass
+
+def _resolve_trservers(site_title, tr_servers, post_id, year,
+                       force=False, deadline=None):
+    """trdekho server pages -> up to 2 extra cards.
+    All player pages fetch in parallel; resolvable players run in
+    priority order (vidmoly > emturbo > as-cdn), deduped by master
+    (query-stripped). Cached + SWR under ('tr'+post_id, 1, 1)."""
+    ckey = ("tr" + str(post_id or "?"), 1, 1)
+    if not force:
+        hit, cards = _cache_get(_CARD_CACHE, ckey)
+        if hit:
+            return cards
+        ent = _CARD_STALE.get(ckey)
+        if ent and ent[0] > time.time() and ent[1]:
+            threading.Thread(target=_tr_refresh,
+                             args=(site_title, tr_servers, post_id,
+                                   year), daemon=True).start()
+            return ent[1]
+    if deadline is None:
+        deadline = time.time() + 10
+
+    def _iframe(u):
+        try:
+            r = _get(u, timeout=8, referer=SITE + "/")
+            m = re.search(r'<iframe[^>]*\ssrc="([^"]+)"', r.text or "")
+            return m.group(1) if m else None
+        except Exception:
+            return None
+
+    players = [p for p in _IO_EX.map(_iframe, tr_servers) if p]
+    tagged = sorted(
+        ((_tr_fam_tag(p), p) for p in players if _tr_fam_tag(p)),
+        key=lambda t: _TR_PRIO.get(t[0], 9))
+    out, seen = [], set()
+    for fam, p in tagged:
+        if len(out) >= 2 or time.time() >= deadline:
+            break
+        master, subs = _player_master(p)
+        if not master:
+            continue
+        noq = master.split("?", 1)[0]
+        if noq in seen:
+            continue
+        seen.add(noq)
+        card = _card_from_master(site_title, fam, master, subs or [], year)
+        if card:
+            out.append(card)
+    if not force:
+        _cache_put(_CARD_CACHE, ckey, out or None,
+                   _CARD_TTL if out else _NEG_TTL)
+        if out:
+            if len(_CARD_STALE) >= _STALE_SWEEP_AT:
+                now = time.time()
+                for k in [k for k, e in _CARD_STALE.items() if e[0] < now]:
+                    _CARD_STALE.pop(k, None)
+            _CARD_STALE[ckey] = (time.time() + _CARD_STALE_TTL, out)
+    return out or None
+
+def _movie_cards(pg, ctitle, year, deadline=None):
+    """movie page-info -> list of cards (embed card + trdekho cards).
+    Old posts: embed only; new posts: trdekho only; dual-pattern posts:
+    both — embed first, then the multi-server extras."""
+    out = []
+    if pg.get("embed"):
+        card = _resolve_card(pg.get("title") or ctitle, pg["embed"],
+                             "movie", 1, 1, year, deadline=deadline)
+        if card:
+            out.append(card)
+    if pg.get("tr_servers"):
+        trs = _resolve_trservers(pg.get("title") or ctitle,
+                                 pg["tr_servers"], pg.get("post_id"),
+                                 year, deadline=deadline)
+        if trs:
+            out.extend(trs[:2])
+    return out
 
 _GENERIC_TOK = {"the", "movie", "film", "official", "camrip", "dub", "dubbed",
                 "sub", "subbed", "hindi", "english", "japanese", "season",
@@ -1011,10 +1212,11 @@ def _build_inner(ctype, imdb, se, ep, deadline=None):
             ss = _season_for_ep(pg["eps"], se, ep, season_index)
             if ss is None:
                 return None                 # this page simply lacks the episode
-            return _resolve_card(
+            card = _resolve_card(
                 pg["title"] or c["title"],
                 SITE + "/embed/%s/%d-%d" % (pg["post_id"], ss, ep),
                 ctype, ss, ep, year, deadline=deadline)
+            return [card] if card else None
 
         worker = _one_series
     else:
@@ -1023,8 +1225,8 @@ def _build_inner(ctype, imdb, se, ep, deadline=None):
             pg = _parse_movie_page(c["url"])
             if not pg:
                 return None
-            return _resolve_card(pg["title"] or c["title"], pg["embed"],
-                                 ctype, 1, 1, year, deadline=deadline)
+            return _movie_cards(pg, c["title"], year,
+                                deadline=deadline) or None
 
         worker = _one_movie
     cards = []
@@ -1036,7 +1238,7 @@ def _build_inner(ctype, imdb, se, ep, deadline=None):
             except Exception:
                 card = None
             if card:
-                cards.append(card)
+                cards.extend(card)      # v1.6.0: workers return lists
             if time.time() >= deadline:
                 for f2 in futs:
                     f2.cancel()
@@ -1200,8 +1402,7 @@ def _prewarm_cycle():
                                       "family": "movie-hindi"})
                     if n_cards >= 8 or (n_series >= 6 and n_cards >= 4):
                         continue                # indexed, not card-warmed
-                    if _resolve_card(pg["title"] or slug, pg["embed"],
-                                     "movie", 1, 1, ""):
+                    if _movie_cards(pg, slug, ""):
                         n_cards += 1
                         epis.append(slug[:24])
             except Exception:
