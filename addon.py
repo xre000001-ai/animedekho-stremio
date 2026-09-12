@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.6.2"
+VERSION = "1.6.3"
 BRAND   = "AnimeDekho"
 PORT    = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("ADK_PUBLIC_URL", "").rstrip("/")
@@ -1043,7 +1043,10 @@ def _resolve_trservers(site_title, tr_servers, post_id, year,
 
     def _iframe(u):
         try:
-            r = _get(u, timeout=8, referer=SITE + "/")
+            # v1.6.3: 12s — with pool-proxied trdekho pages, the old 8s
+            # cut the OTHER resolvable slots (emturbo) off at exactly the
+            # moment the first (vidmoly) landed, caching just 1 card
+            r = _get(u, timeout=12, referer=SITE + "/")
             m = re.search(r'<iframe[^>]*\ssrc="([^"]+)"', r.text or "")
             return m.group(1) if m else None
         except Exception:
