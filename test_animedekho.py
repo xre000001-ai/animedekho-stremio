@@ -395,7 +395,7 @@ def test_swr_serves_stale_and_refreshes():
 def test_manifest_shape():
     m = json.loads(json.dumps(addon.MANIFEST))
     assert m["id"] == "com.animedekho.stremio"
-    assert m["resources"] == ["stream"]                  # stream-only
+    assert m["resources"] == ["stream", "subtitles"]     # v1.9.0 Nuvio
     assert set(m["types"]) == {"movie", "series"}
     assert m["idPrefixes"] == ["tt", "kitsu", "anilist", "mal"]  # v1.4.0: +anilist/mal
 

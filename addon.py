@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.8.1"
+VERSION = "1.9.0"
 BRAND   = "AnimeDekho"
 ADDON_NAME = "ΛNIME | VERSE"      # v1.7.0 user-named brand
 ADDON_LOGO = "https://i.postimg.cc/pXvhmfg1/Chat-GPT-Image-Sep-12-2026-11-32-08-AM.png"
@@ -95,7 +95,10 @@ MANIFEST = {
                     "only tiny JSON is served, media flows directly from the "
                     "CDN to your player."),
     "types": ["movie", "series"],
-    "resources": ["stream"],
+    # v1.9.0: subtitles declared as an addon RESOURCE — players that
+    # fetch subs via the subtitles-resource protocol (Nuvio etc.) now
+    # see them; stream-embedded subs stay for classic Stremio clients.
+    "resources": ["stream", "subtitles"],
     "idPrefixes": ["tt", "kitsu", "anilist", "mal"],
     "catalogs": [],
 }
@@ -1815,6 +1818,28 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._send(200, json.dumps(
                     {"error": "%s: %s" % (type(e).__name__, str(e)[:120])}))
+
+        # v1.9.0: subtitles-resource route (same id grammar as /stream).
+        # Nuvio-style players ignore stream-embedded subs and call THIS;
+        # the answer reuses the (cached) card build, so it is usually
+        # instant and costs no extra site traffic.
+        m = re.match(r"^/subtitles/(movie|series)/"
+                    r"((?:tt\d+|kitsu:\d+|anilist:\d+|mal:\d+))"
+                    r"(?::(\d+):(\d+))?\.json$", path)
+        if m:
+            ctype, sid = m.group(1), m.group(2)
+            se, ep = int(m.group(3) or 1), int(m.group(4) or 1)
+            res = build_streams(ctype, sid, se, ep)
+            subs, seen = [], set()
+            for c in (res.get("streams") or []):
+                for s in (c.get("subtitles") or []):
+                    u = s.get("url")
+                    if u and u not in seen:
+                        seen.add(u)
+                        subs.append({"url": u, "lang": s.get("lang", "en"),
+                                     "id": s.get("id", "adk-en")})
+            return self._send(200, json.dumps(
+                {"subtitles": subs, "cacheMaxAge": 300}))
 
         m = re.match(r"^/stream/(movie|series)/"
                     r"((?:tt\d+|kitsu:\d+|anilist:\d+|mal:\d+))"
