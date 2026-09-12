@@ -254,7 +254,8 @@ def test_resolve_card_full():
     vs = json.loads(GETVIDEO_JSON)["videoSource"]
     key = card["url"].split("/")[2]
     assert addon._hls_key(vs) == key and addon._HLS_KEYS.get(key) == vs
-    assert "1080p" in card["description"] and "Hindi" in card["description"]
+    assert "1080p" in card["name"]                      # v1.7.1 ♧ highest-only
+    assert "Hindi" in card["description"]               # v1.7.1 ◈ glass lang line
     assert card["subtitles"][0]["lang"] == "eng"
     assert card["behaviorHints"]["isBingeable"]
     # direct card: no proxyHeaders needed at all

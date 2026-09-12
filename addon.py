@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 BRAND   = "AnimeDekho"
 ADDON_NAME = "ΛNIME | VERSE"      # v1.7.0 user-named brand
 ADDON_LOGO = "https://i.postimg.cc/pXvhmfg1/Chat-GPT-Image-Sep-12-2026-11-32-08-AM.png"
@@ -867,17 +867,18 @@ def _master_info(master_url):
 # --------------------------------------------------------------------------
 # 6. card building
 # --------------------------------------------------------------------------
-_CARD_GROUP = "ΛNIME VERSE"
+_CARD_GROUP = ADDON_NAME   # v1.7.1: ⌗ carries the addon name
 
 def _fmt_stream_card(site_title, info, subs, ctype, se, ep, year,
                      fam=None):
     """v1.7.0 unified card format (user spec):
 
         ♧ HD 720p  ✹ Title
-        ◫ S02 E05 ◇ 480–720p ▧ AVC ⇡ 3.2 Mbps
-        ◈ WEB-DL ♫ AAC · Hindi/English ◉ 2.0
-        ⌗ ΛNIME VERSE
-        ⌬ AnimeDekho · vidmoly  ◴ 2026 ⟡ 1 SUB
+        ◫ S02 E05 ▧ AVC ⇡ 3.2 Mbps
+        ◈ WEB-DL ♫ AAC ◉ 2.0
+        ◈ Hindi · English
+        ⌗ ΛNIME | VERSE
+        ⌬ vidmoly  ◴ 2026 ⟡ 1 SUB
 
     Every token is real data parsed from the HLS master; anything we
     don't have is dropped honestly, never faked."""
@@ -890,29 +891,27 @@ def _fmt_stream_card(site_title, info, subs, ctype, se, ep, year,
     else:
         ql = "SD %dp" % mx
     t1 = ["◫ S%02d E%02d" % (se, ep) if ctype == "series" else "◫ MOVIE"]
-    if len(res) > 1:
-        t1.append("◇ %d–%dp" % (min(res), max(res)))
     if info.get("vcodec"):
         t1.append("▧ %s" % info["vcodec"])
     if info.get("bps"):
         t1.append("⇡ %s" % info["bps"])
     t2 = ["◈ WEB-DL"]
-    ac = info.get("acodec") or ""
-    langs = [l for l in info.get("langs", []) if _LANG_NAME.get(l, l)]
-    lnames = "/".join(_LANG_NAME.get(l, l) for l in langs[:4])
-    aud = " · ".join(x for x in (ac, lnames) if x)
-    t2.append("♫ %s" % (aud or "multi-audio"))
+    if info.get("acodec"):
+        t2.append("♫ %s" % info["acodec"])
     if info.get("ch"):
         t2.append("◉ %s" % info["ch"])
-    t4 = ["⌬ AnimeDekho" + (" · %s" % fam if fam else "")]
+    langs = [l for l in info.get("langs", []) if _LANG_NAME.get(l, l)]
+    t2b = ["◈ " + " · ".join(_LANG_NAME.get(l, l) for l in langs[:4])] \
+        if langs else []
+    t4 = ["⌬ %s" % fam] if fam else []
     y = str(year or "")[:4]                 # '2024–' (running) -> '2024'
     if y.isdigit():
         t4.append("◴ %s" % y)
     if subs:
         t4.append("⟡ %d SUB" % len(subs))
     return ("♧ %s  ✹ %s" % (ql, site_title),
-            "\n".join([" ".join(t1), " ".join(t2),
-                       "⌗ %s" % _CARD_GROUP, "  ".join(t4)]))
+            "\n".join([" ".join(t1), " ".join(t2)] + t2b +
+                      ["⌗ %s" % ADDON_NAME, "  ".join(t4)]))
 
 def _card_refresh(site_title, embed_url, ctype, se, ep, year):
     """SWR for the card cache: re-resolve in the background, in-place."""
