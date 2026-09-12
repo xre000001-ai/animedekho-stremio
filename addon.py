@@ -39,6 +39,7 @@ import random
 import re
 import threading
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote, unquote, urljoin
@@ -48,7 +49,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 BRAND   = "AnimeDekho"
 PORT    = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("ADK_PUBLIC_URL", "").rstrip("/")
@@ -268,7 +269,11 @@ def _get(url, timeout=8, referer=None):
         return _DeadResponse()
 
 def _norm(t):
-    return re.sub(r"[^a-z0-9]", "", (t or "").lower())
+    # v1.4.1: NFKD + ascii fold FIRST — 'Ranma ½' vs the site's 'Ranma 1/2'
+    # both become 'ranma12' (½ -> '1⁄2' -> '12'); full-width '！' -> '!'…
+    t = unicodedata.normalize("NFKD", (t or "").lower())
+    t = t.encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]", "", t)
 
 def _clean_title(t):
     """Strip trailing dub/sub qualifiers: 'Naruto - Hindi Dub' -> 'Naruto'.
@@ -358,7 +363,10 @@ def _extract_cards(html):
 def _kitsu_title(kid):
     """kitsu:<id> -> (title, year) via the public kitsu.io API (v1.3.0 —
     Stremio's anime catalogs use KITSU ids; without this the addon never
-    showed a stream in them). anime-kitsu.strem.io is dead (DNS)."""
+    showed a stream in them). anime-kitsu.strem.io is dead (DNS).
+    v1.4.1: prefer titles.EN over canonicalTitle — canonical is usually
+    the romaji ('Ore dake Level Up na Ken: Season 2...') while the site
+    lists English names ('Solo Leveling'); romaji searches always miss."""
     hit, val = _cache_get(_META_CACHE, ("kitsu", kid))
     if hit:
         return val
@@ -366,7 +374,7 @@ def _kitsu_title(kid):
     try:
         r = _get("https://kitsu.io/api/edge/anime/%s" % kid, timeout=6)
         a = ((r.json() or {}).get("data") or {}).get("attributes") or {}
-        t = a.get("canonicalTitle") or (a.get("titles") or {}).get("en") \
+        t = (a.get("titles") or {}).get("en") or a.get("canonicalTitle") \
             or (a.get("titles") or {}).get("en_jp") or ""
         if t:
             val = (t, str(a.get("startDate") or "")[:4])
@@ -374,6 +382,69 @@ def _kitsu_title(kid):
     except Exception:
         pass
     return val
+
+# v1.4.1: kitsu catalogs split every season into its OWN single-season
+# entry ('DAN DA DAN Season 2' = kitsu 49425, eps 1x1..1x12) while the
+# site packs the whole series into one post numbered 2x1..2x12 — the
+# direct (se, ep) lookup misses and the user sees no stream. Derive
+# WHICH site season the entry is by counting same-franchise TV entries
+# (kitsu filter[text], sorted by startDate) up to and including ours.
+_SEASON_MARK_RE = re.compile(
+    r"\b(?:\d{1,2}(?:st|nd|rd|th)\s+season|season\s+\d{1,2}"
+    r"|part\s+\d{1,2}|cour\s+\d{1,2}|final\s+season)\b", re.I)
+
+
+def _season_stripped(t):
+    """remove 'Season 2'/'2nd Season'/'Part 2' markers anywhere in the
+    title — 'Solo Leveling Season 2 -Arise from the Shadow-' ->
+    'Solo Leveling -Arise from the Shadow-'."""
+    return _SEASON_MARK_RE.sub(" ", t or "").strip(" \t-\u2013\u2014:|")
+
+
+def _kitsu_season_index(kid):
+    """kitsu entry -> 1-based season index within its franchise (cached;
+    None when undeterminable — then the strict (se, ep) lookup stands)."""
+    hit, val = _cache_get(_META_CACHE, ("kseas", kid))
+    if hit:
+        return val
+    idx = None
+    try:
+        meta = _kitsu_title(kid)
+        if meta:
+            base = _season_stripped(meta[0]).split()
+            q = " ".join(base[:2]) if len(base) >= 2 else (base[0] if base else "")
+            if q:
+                r = _get("https://kitsu.io/api/edge/anime?filter%5Btext%5D="
+                         + quote(q)
+                         + "&page%5Blimit%5D=20&sort=startDate", timeout=8)
+                n = 0
+                for a in ((r.json() or {}).get("data") or []):
+                    at = a.get("attributes") or {}
+                    if at.get("subtype") != "TV":
+                        continue        # movies/specials/OVAs skew the count
+                    n += 1
+                    if str(a.get("id")) == str(kid):
+                        idx = n
+                        break           # startDate-sorted: ours == the index
+    except Exception:
+        idx = None
+    _cache_put(_META_CACHE, ("kseas", kid), idx, _META_TTL)
+    return idx
+
+
+def _season_for_ep(eps, se, ep, season_index):
+    """the site season that actually serves (ep): the direct hit first,
+    then the kitsu-derived index, then the unique season containing ep
+    (One Piece pattern: kitsu 1x1100 lives at the site's 22x1100)."""
+    if (se, ep) in eps:
+        return se
+    if season_index and (season_index, ep) in eps:
+        return season_index
+    alts = sorted({s for (s, e) in eps if e == ep})
+    if len(alts) == 1:
+        return alts[0]
+    return None
+
 
 def site_search(kw):
     """/?s= result cards -> [(title, url, family)] (series-hindi|movie-hindi)."""
@@ -699,13 +770,26 @@ def _match_candidates(cands, want_title, family):
     return []
 
 def _build_inner(ctype, imdb, se, ep):
+    season_index = None
     if (imdb or "").startswith("kitsu:"):
-        meta = _kitsu_title(imdb.split(":", 1)[1])
+        kid = imdb.split(":", 1)[1]
+        meta = _kitsu_title(kid)
+        if meta:
+            # v1.4.1: a season entry ('DAN DA DAN Season 2') must search
+            # and match the BASE name, and its 1xN episodes must be
+            # remapped to the site's real season number
+            base = _season_stripped(meta[0])
+            if base and base != meta[0]:
+                season_index = _kitsu_season_index(kid)
+                meta = (base, meta[1])
     else:
         meta = _cinemeta(ctype, imdb)
     if not meta:
         return {"streams": [], "message": "no metadata for this id"}
     title, year = meta
+    # v1.4.1: disambiguation parens ('Ranma ½ (2024)', '(TV)') never
+    # appear on the site — strip them or exact matching breaks
+    title = re.sub(r"\s*\((?:19|20)\d{2}\)\s*$|\s*\(TV\)\s*$", "", title).strip()
     cands = search_candidates(title)
     if not cands:
         return {"streams": [], "message": "not on %s (search empty)" % BRAND}
@@ -716,14 +800,15 @@ def _build_inner(ctype, imdb, se, ep):
             pg = _parse_series_page(c["url"])
             if not pg:
                 continue
-            if (se, ep) not in pg["eps"]:
+            ss = _season_for_ep(pg["eps"], se, ep, season_index)
+            if ss is None:
                 continue                     # this page simply lacks the episode
             name = pg["title"] or c["title"]
             if len(matched) > 1 and cards:
                 name += " · alt"
             card = _resolve_card(name,
-                                 SITE + "/embed/%s/%d-%d" % (pg["post_id"], se, ep),
-                                 ctype, se, ep, year)
+                                 SITE + "/embed/%s/%d-%d" % (pg["post_id"], ss, ep),
+                                 ctype, ss, ep, year)
             if card:
                 cards.append(card)
     else:
