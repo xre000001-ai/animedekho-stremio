@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.6.6"
+VERSION = "1.6.7"
 BRAND   = "AnimeDekho"
 PORT    = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("ADK_PUBLIC_URL", "").rstrip("/")
@@ -1017,7 +1017,12 @@ def _player_master(player_url):
 
 _TR_FAM_TAG = (("vidmoly", "vidmoly"), ("emturbovid", "emturbo"),
                ("turboviplay", "emturbo"), ("as-cdn", "cdn"))
-_TR_PRIO = {"vidmoly": 0, "emturbo": 1, "cdn": 2}
+# v1.6.7: emturbo FIRST — its GDrive segments are IP-free and always
+# play, while the vidmoly master token is minting-IP-bound (verified:
+# prod-minted token 200s from the minting IP, 403 from any other, even
+# token-stripped/referer/chrome-UA) — a user's player would blank on
+# vidmoly segments, so the always-playable card must be the default.
+_TR_PRIO = {"emturbo": 0, "vidmoly": 1, "cdn": 2}
 
 def _tr_fam_tag(u):
     for k, v in _TR_FAM_TAG:
