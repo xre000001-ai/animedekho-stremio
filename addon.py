@@ -867,6 +867,18 @@ def _master_info(master_url):
 # --------------------------------------------------------------------------
 # 6. card building
 # --------------------------------------------------------------------------
+def _server_fam(master_url):
+    """v1.7.1: short server label from the master host (for the ⌬ line)."""
+    try:
+        h = (urlparse(master_url).hostname or "").lower().strip(".")
+    except Exception:
+        return None
+    for fam in ("emturbovid", "vidmoly", "xerver", "filesforever",
+                "rubystm", "abyss", "cloudy", "upns"):
+        if fam in h:
+            return fam
+    return h.split(".")[0] or None
+
 _CARD_GROUP = ADDON_NAME   # v1.7.1: ⌗ carries the addon name
 
 def _fmt_stream_card(site_title, info, subs, ctype, se, ep, year,
@@ -970,7 +982,8 @@ def _resolve_card(site_title, embed_url, ctype, se, ep, year,
     except Exception:
         subs = []
     card_name, card_desc = _fmt_stream_card(
-        site_title, info, subs, ctype, se, ep, year)
+        site_title, info, subs, ctype, se, ep, year,
+        fam=_server_fam(master))
     card = {
         "name": card_name,
         "description": card_desc,
