@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.9.3"
+VERSION = "1.9.4"
 BRAND   = "AnimeDekho"
 ADDON_NAME = "ΛNIME | VERSE"      # v1.7.0 user-named brand
 ADDON_LOGO = "https://i.postimg.cc/pXvhmfg1/Chat-GPT-Image-Sep-12-2026-11-32-08-AM.png"
@@ -1861,6 +1861,12 @@ class Handler(BaseHTTPRequestHandler):
                     or imdb.startswith("mal:")):
                 return self._send(200, json.dumps({"streams": []}))
             res = build_streams(ctype, imdb, se, ep)
+            if ctype == "series" and (res.get("streams") or []):
+                # v1.9.4: they're watching — warm the NEXT episode in
+                # the background so the next tap is instant.
+                threading.Thread(
+                    target=build_streams, daemon=True,
+                    args=("series", imdb, se, ep + 1)).start()
             # v1.2.0: card urls are relative /hls/… routes — absolutize
             # against the request host so players get a full https url
             host = (self.headers.get("Host") or "").strip()
