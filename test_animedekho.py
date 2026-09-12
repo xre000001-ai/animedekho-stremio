@@ -102,7 +102,7 @@ class R:
 def _reset():
     for s in (addon._META_CACHE, addon._SEARCH_CACHE, addon._PAGE_CACHE,
               addon._MASTER_CACHE, addon._STREAM_CACHE, addon._STREAM_STALE,
-              addon._REQLOG):
+              addon._REQLOG, addon._CARD_CACHE, addon._CARD_STALE):
         s.clear()
     addon._SWR_RUNNING.clear()
 
@@ -245,6 +245,7 @@ def test_resolve_card_full():
             return R(PLAYER_HTML)
         return R(MASTER)
     with mock.patch.object(addon, "_get", side_effect=fake_get), \
+         mock.patch.object(addon, "_sub_alive", return_value=True), \
          mock.patch.object(addon._S, "post", return_value=R(js=json.loads(GETVIDEO_JSON))):
         card = addon._resolve_card("Jujutsu Kaisen",
                                    "https://animedekho.app/embed/95479/2-3",
@@ -257,7 +258,7 @@ def test_resolve_card_full():
     assert addon._hls_key(vs) == key and addon._HLS_KEYS.get(key) == vs
     assert "1080p" in card["name"]                      # v1.7.1 ♧ highest-only
     assert "Hindi" in card["description"]               # v1.7.1 ◈ glass lang line
-    assert card["subtitles"][0]["lang"] == "eng"
+    assert card["subtitles"] and card["subtitles"][0]["lang"] == "en"  # v1.8.1
     assert card["behaviorHints"]["isBingeable"]
     # direct card: no proxyHeaders needed at all
     assert "proxyHeaders" not in (card.get("behaviorHints") or {})
