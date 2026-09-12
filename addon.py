@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.6.4"
+VERSION = "1.6.5"
 BRAND   = "AnimeDekho"
 PORT    = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("ADK_PUBLIC_URL", "").rstrip("/")
@@ -934,6 +934,34 @@ def _resolve_card(site_title, embed_url, ctype, se, ep, year,
 # --------------------------------------------------------------------------
 # 6b. v1.6.0 trdekho multi-server engine (new movie posts)
 # --------------------------------------------------------------------------
+def _get_alt_exit(url, timeout=8, referer=None):
+    """v1.6.5: one fetch through a FRESH pool exit — emturbovid serves a
+    bot-wall stub page (HTTP 200, no master literal) to some egress IPs
+    and the real player page to others, so a 200 response alone proves
+    nothing. Bypass the sticky exit on purpose to rotate IPs."""
+    hd = {"User-Agent": UA}
+    if referer:
+        hd["Referer"] = referer
+    with _POOL_LOCK:
+        _POOL_STICKY[0] = None
+        _POOL_STICKY[1] = 0.0
+    for _ in range(3):
+        u = _pick_exit(time.time())
+        if u is None:
+            _pool_refresh(force=True)
+            u = _pick_exit(time.time())
+            if u is None:
+                return None
+        try:
+            r = _S.get(url, headers=hd, timeout=timeout,
+                       proxies={"http": u, "https": u})
+            if r.status_code not in (403, 406):
+                return r
+            _POOL_BAD[u] = time.time() + 900
+        except Exception:
+            _POOL_BAD[u] = time.time() + 600
+    return None
+
 def _player_master(player_url):
     """player iframe url -> (master_url, subs) | (None, None).
     Dispatch: as-cdnN.top keeps the v1.2.0 getVideo POST chain; vidmoly
@@ -968,10 +996,21 @@ def _player_master(player_url):
                                  "id": "vm-eng"})
             return m.group(1), subs
         if "emturbovid" in player_url or "turboviplay" in player_url:
-            r = _get(player_url, timeout=8, referer=SITE + "/")
-            m = re.search(r'(https://cdn\d+\.turboviplay\.com/[^\s"\'\\]+\.m3u8)',
-                          r.text or "")
-            return (m.group(1), []) if m else (None, None)
+            # v1.6.5: a 200 stub page means THIS egress IP is bot-walled —
+            # rotate pool exits until the master literal shows up
+            for attempt in range(3):
+                if attempt == 0:
+                    r = _get(player_url, timeout=8, referer=SITE + "/")
+                else:
+                    r = _get_alt_exit(player_url, timeout=8,
+                                      referer=SITE + "/")
+                    if r is None:
+                        return None, None
+                m = re.search(r'(https://cdn\d+\.turboviplay\.com/[^\s"\'\\]+\.m3u8)',
+                              r.text or "")
+                if m:
+                    return m.group(1), []
+            return None, None
         return None, None
     except Exception:
         return None, None
