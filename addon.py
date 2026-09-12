@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.6.3"
+VERSION = "1.6.4"
 BRAND   = "AnimeDekho"
 PORT    = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("ADK_PUBLIC_URL", "").rstrip("/")
@@ -1615,6 +1615,37 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._send(200, json.dumps(
                     {"error": "%s: %s" % (type(e).__name__, str(e)[:120])}))
+
+        if path == "/debug/tr":
+            # v1.6.4: trdekho grid forensics from THIS host's egress —
+            # per-slot fetch status/bytes/latency, iframe src, family tag
+            # and master-resolution outcome
+            k = (q.get("k") or [""])[0]
+            trid = (q.get("trid") or [""])[0]
+            trtype = (q.get("trtype") or ["1"])[0]
+            if k != "adk-dbg-9c2f" or not trid.isdigit():
+                return self._send(404, json.dumps({"error": "not found"}))
+            slots = []
+            for n in range(9):
+                u = "%s/?trdekho=%d&trid=%s&trtype=%s" % (SITE, n, trid, trtype)
+                t0 = time.time()
+                try:
+                    r = _get(u, timeout=12, referer=SITE + "/")
+                    dt = round(time.time() - t0, 2)
+                    m = re.search(r'<iframe[^>]*\ssrc="([^"]+)"', r.text or "")
+                    purl = m.group(1) if m else None
+                except Exception as e:
+                    r, dt, purl = None, round(time.time() - t0, 2), None
+                ent = {"n": n, "st": getattr(r, "status_code", None),
+                       "bytes": len(getattr(r, "text", "") or ""),
+                       "s": dt, "iframe": (purl or "")[:60],
+                       "fam": (_tr_fam_tag(purl) if purl else None)}
+                if purl and ent["fam"]:
+                    master, subs = _player_master(purl)
+                    ent["master"] = (master or "NONE")[:70]
+                    ent["subs"] = len(subs or [])
+                slots.append(ent)
+            return self._send(200, json.dumps({"trid": trid, "slots": slots}))
 
         if path == "/debug/search":
             # ground truth for site egress from THIS host (is the site
