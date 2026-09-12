@@ -290,8 +290,8 @@ def test_build_series_happy_path():
         res = addon.build_streams("series", "tt1234", 2, 3)
     assert len(res["streams"]) == 1
     c = res["streams"][0]
-    assert c["name"] == "𖤍 Jujutsu Kaisen"
-    assert "S02E03" in c["description"]
+    assert c["name"].endswith("Jujutsu Kaisen")   # v1.7.0 ♧/✹ format
+    assert "S02 E03" in c["description"]   # v1.7.0 ◫ Sxx Exx format
     # cached now
     res2 = addon.build_streams("series", "tt1234", 2, 3)
     assert res2["streams"] == res["streams"]
@@ -348,7 +348,7 @@ def test_build_movie_multiple_matches_alt_suffix():
         res = addon.build_streams("movie", "tt5311514", 1, 1)
     assert len(res["streams"]) == 2
     names = [c["name"] for c in res["streams"]]
-    assert names[0] == "𖤍 Jujutsu Kaisen 0"          # from MOVIE_HTML h1
+    assert names[0].endswith("Jujutsu Kaisen 0")    # v1.7.0 ♧/✹ format
     assert names[1].endswith("· alt")
 
 def test_cache_put_sweeps_expired():

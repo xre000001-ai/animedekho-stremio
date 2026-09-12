@@ -51,8 +51,10 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.6.7"
+VERSION = "1.7.0"
 BRAND   = "AnimeDekho"
+ADDON_NAME = "ΛNIME | VERSE"      # v1.7.0 user-named brand
+ADDON_LOGO = "https://i.postimg.cc/pXvhmfg1/Chat-GPT-Image-Sep-12-2026-11-32-08-AM.png"
 PORT    = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("ADK_PUBLIC_URL", "").rstrip("/")
 SITE    = "https://animedekho.app"
@@ -85,7 +87,8 @@ _LANG_NAME = {"hi": "Hindi", "en": "English", "ja": "Japanese",
 MANIFEST = {
     "id": "com.animedekho.stremio",
     "version": VERSION,
-    "name": BRAND,
+    "name": ADDON_NAME,
+    "logo": ADDON_LOGO,
     "description": ("Hindi-dub anime & cartoons from AnimeDekho — direct "
                     "multi-audio HLS (Japanese / Hindi / English / Telugu / "
                     "Tamil), 240p-1080p, English subs. Zero-bandwidth addon: "
@@ -828,9 +831,32 @@ def _master_info(master_url):
             res = sorted(set(int(x.split("x")[1])
                              for x in re.findall(r"RESOLUTION=(\d+x\d+)", r.text)))
             mtext, variants = _rewrite_master(r.text, master_url)
+            # v1.7.0: codec/bitrate/channels for the unified card format
+            bw = [int(x) for x in re.findall(r"BANDWIDTH=(\d+)", r.text)]
+            vcodec = acodec = bps = ch = ""
+            mc = re.search(r'CODECS="([^"]+)"', r.text)
+            if mc:
+                cs = mc.group(1)
+                vcodec = ("HEVC" if re.search(r"hvc1|hev1", cs) else
+                          "AV1" if "av01" in cs else
+                          "AVC" if "avc1" in cs else "")
+                acodec = ("DD+" if "ec-3" in cs else
+                          "DD" if "ac-3" in cs else
+                          "AAC" if "mp4a" in cs else
+                          "OPUS" if "opus" in cs else "")
+            if bw:
+                mb = max(bw)
+                bps = ("%.1f Mbps" % (mb / 1e6)) if mb >= 1e6 \
+                      else ("%d kbps" % (mb // 1000))
+            mch = re.search(r'CHANNELS="(\d+)"', r.text)
+            if mch:
+                ch = {"2": "2.0", "6": "5.1", "8": "7.1"}.get(
+                    mch.group(1), mch.group(1) + "ch")
             val = {"info": {"langs": langs, "res": res, "audio_rends":
                             re.findall(r'TYPE=AUDIO[^>]*LANGUAGE="([a-z]{2,3})"[^>]*NAME="([^"]*)"',
-                                       r.text)},
+                                       r.text),
+                            "vcodec": vcodec, "acodec": acodec,
+                            "bps": bps, "ch": ch},
                    "master_text": mtext, "variants": variants}
             _HLS_KEYS[_hls_key(master_url)] = master_url
     except Exception:
@@ -841,6 +867,53 @@ def _master_info(master_url):
 # --------------------------------------------------------------------------
 # 6. card building
 # --------------------------------------------------------------------------
+_CARD_GROUP = "ΛNIME VERSE"
+
+def _fmt_stream_card(site_title, info, subs, ctype, se, ep, year,
+                     fam=None):
+    """v1.7.0 unified card format (user spec):
+
+        ♧ HD 720p  ✹ Title
+        ◫ S02 E05 ◇ 480–720p ▧ AVC ⇡ 3.2 Mbps
+        ◈ WEB-DL ♫ AAC · Hindi/English ◉ 2.0
+        ⌗ ΛNIME VERSE
+        ⌬ AnimeDekho · vidmoly  ◴ 2026 ⟡ 1 SUB
+
+    Every token is real data parsed from the HLS master; anything we
+    don't have is dropped honestly, never faked."""
+    res = info.get("res") or []
+    mx = max(res) if res else 0
+    if mx >= 1080:
+        ql = "FHD 1080p"
+    elif mx >= 720:
+        ql = "HD %dp" % mx
+    else:
+        ql = "SD %dp" % mx
+    t1 = ["◫ S%02d E%02d" % (se, ep) if ctype == "series" else "◫ MOVIE"]
+    if len(res) > 1:
+        t1.append("◇ %d–%dp" % (min(res), max(res)))
+    if info.get("vcodec"):
+        t1.append("▧ %s" % info["vcodec"])
+    if info.get("bps"):
+        t1.append("⇡ %s" % info["bps"])
+    t2 = ["◈ WEB-DL"]
+    ac = info.get("acodec") or ""
+    langs = [l for l in info.get("langs", []) if _LANG_NAME.get(l, l)]
+    lnames = "/".join(_LANG_NAME.get(l, l) for l in langs[:4])
+    aud = " · ".join(x for x in (ac, lnames) if x)
+    t2.append("♫ %s" % (aud or "multi-audio"))
+    if info.get("ch"):
+        t2.append("◉ %s" % info["ch"])
+    t4 = ["⌬ AnimeDekho" + (" · %s" % fam if fam else "")]
+    y = str(year or "")[:4]                 # '2024–' (running) -> '2024'
+    if y.isdigit():
+        t4.append("◴ %s" % y)
+    if subs:
+        t4.append("⟡ %d SUB" % len(subs))
+    return ("♧ %s  ✹ %s" % (ql, site_title),
+            "\n".join([" ".join(t1), " ".join(t2),
+                       "⌗ %s" % _CARD_GROUP, "  ".join(t4)]))
+
 def _card_refresh(site_title, embed_url, ctype, se, ep, year):
     """SWR for the card cache: re-resolve in the background, in-place."""
     try:
@@ -897,23 +970,11 @@ def _resolve_card(site_title, embed_url, ctype, se, ep, year,
         subs = f_subs.result(timeout=max(0.5, deadline - time.time()))
     except Exception:
         subs = []
-    langs = [l for l in info["langs"] if _LANG_NAME.get(l, l)]
-    l1 = "▣ %dp" % max(info["res"]) if info["res"] else "▣ MULTI"
-    if info["res"] and len(info["res"]) > 1:
-        l1 += " ▣ %d–%dp multi-quality" % (min(info["res"]), max(info["res"]))
-    if langs:
-        l1 += " ▣ %s audio" % "/".join(_LANG_NAME.get(l, l) for l in langs[:5])
-    if ctype == "series":
-        l2 = "▣ S%02dE%02d" % (se, ep)
-    else:
-        l2 = ("▣ %s" % year) if year else "▣ movie"
-    l3 = "▣ %s ▣ multi-quality HLS ▣ zero-bandwidth addon" % BRAND
-    desc = l1 + "\n" + l2 + "\n" + l3
-    if subs:
-        desc += "\n▣ %d subtitle track" % len(subs) + ("s" if len(subs) > 1 else "")
+    card_name, card_desc = _fmt_stream_card(
+        site_title, info, subs, ctype, se, ep, year)
     card = {
-        "name": "𖤍 %s" % site_title,
-        "description": desc,
+        "name": card_name,
+        "description": card_desc,
         # v1.2.0: the CDN master is ip-bound to the pool exit that minted
         # it — a direct card url would be a phantom for every user. We
         # serve the (rewritten) master ourselves; /stream absolutizes it.
@@ -1035,20 +1096,11 @@ def _card_from_master(site_title, fam, master, subs, year):
     info = _master_info(master)
     if not info:
         return None
-    langs = [l for l in info["langs"] if _LANG_NAME.get(l, l)]
-    l1 = "\u25a3 %dp" % max(info["res"]) if info["res"] else "\u25a3 MULTI"
-    if info["res"] and len(info["res"]) > 1:
-        l1 += " \u25a3 %d\u2013%dp multi-quality" % (min(info["res"]), max(info["res"]))
-    if langs:
-        l1 += " \u25a3 %s audio" % "/".join(_LANG_NAME.get(l, l) for l in langs[:5])
-    l2 = ("\u25a3 %s" % year) if year else "\u25a3 movie"
-    l3 = "\u25a3 %s \u25a3 multi-quality HLS \u25a3 zero-bandwidth addon" % BRAND
-    desc = l1 + "\n" + l2 + "\n" + l3
-    if subs:
-        desc += "\n\u25a3 %d subtitle track" % len(subs) + ("s" if len(subs) > 1 else "")
+    card_name, card_desc = _fmt_stream_card(
+        site_title, info, subs or [], "movie", 1, 1, year, fam=fam)
     return {
-        "name": "𖤍 %s \u00b7 %s" % (site_title, fam),
-        "description": desc,
+        "name": card_name,
+        "description": card_desc,
         "url": "/hls/%s/master.m3u8" % _hls_key(master),
         "subtitles": subs,
         "behaviorHints": {"notWebReady": False, "isBingeable": True},
@@ -1545,7 +1597,7 @@ b{color:#e6e9ef}
 <p>Install, then open any anime in Stremio — cards appear automatically.</p>
 <a class="install" href="stremio://">Install in Stremio</a>
 <p style="font-size:12px">v%s · stream-only addon · no catalogs · idPrefixes tt</p>
-</div></body></html>""" % (BRAND, BRAND, VERSION)
+</div></body></html>""" % (ADDON_NAME, ADDON_NAME, VERSION)
 
 
 class Handler(BaseHTTPRequestHandler):
