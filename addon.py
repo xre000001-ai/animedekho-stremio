@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.6.5"
+VERSION = "1.6.6"
 BRAND   = "AnimeDekho"
 PORT    = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("ADK_PUBLIC_URL", "").rstrip("/")
@@ -1091,27 +1091,42 @@ def _resolve_trservers(site_title, tr_servers, post_id, year,
         except Exception:
             return None
 
-    # v1.6.1: consume player pages AS THEY LAND (map's ordered iterator
-    # stalled behind the slowest pool fetch) and bail out as soon as two
-    # cards are built — the wall clock is dominated by the 9 pool
-    # fetches, not the (direct, fast) player chains.
-    futs = {_IO_EX.submit(_iframe, u): u for u in tr_servers}
+    # v1.6.6: two-stage pipeline. Stage 1 fetches the player pages and,
+    # the moment one lands with a resolvable family, SUBMITS its player
+    # chain to the pool too (an emturbo exit-rotation runs 2-3 extra
+    # fetches and can take 10s+ — it must never block the vidmoly
+    # card). Stage 2 then collects the chain results into cards.
+    # Stage 1 also gets its own 8s cap: one dead-slow page must not
+    # eat the whole budget while every chain result waits unseen.
+    page_futs = {_IO_EX.submit(_iframe, u): u for u in tr_servers}
+    chain_futs = {}                     # chain future -> family tag
     out, seen = [], set()
     timed_out = False
+    page_deadline = min(deadline, time.time() + 8)
     try:
-        for f in as_completed(futs, timeout=max(1.0, deadline - time.time())):
-            if len(out) >= 2 or time.time() >= deadline:
+        for f in as_completed(page_futs,
+                              timeout=max(1.0, page_deadline - time.time())):
+            if time.time() >= page_deadline:
                 break
             try:
                 p = f.result()
             except Exception:
                 p = None
-            if not p:
-                continue
-            fam = _tr_fam_tag(p)
-            if not fam:
-                continue               # uncracked player host
-            master, subs = _player_master(p)
+            fam = _tr_fam_tag(p) if p else None
+            if fam and len(chain_futs) < 4:
+                chain_futs[_IO_EX.submit(_player_master, p)] = fam
+    except FuturesTimeoutError:
+        pass
+    try:
+        for f in as_completed(list(chain_futs),
+                              timeout=max(0.5, deadline - time.time())):
+            if len(out) >= 2 or time.time() >= deadline:
+                break
+            fam = chain_futs[f]
+            try:
+                master, subs = f.result()
+            except Exception:
+                master, subs = None, None
             if not master:
                 continue
             noq = master.split("?", 1)[0]
