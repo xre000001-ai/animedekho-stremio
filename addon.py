@@ -725,16 +725,41 @@ def _embed_iframe(embed_url):
     except Exception:
         return None
 
+def _sub_alive(u):
+    """v1.8.1: a 1KB ranged GET — is this subtitle track really there?
+    (The player pages pack 10 tracks; some are dead 404s.)"""
+    try:
+        r = _S.get(u, headers={"Range": "bytes=0-255", "Referer": SITE + "/",
+                               "User-Agent": UA}, timeout=4)
+        return r.status_code in (200, 206)
+    except Exception:
+        return False
+
 def _player_subs(player_url):
-    """player page -> [{'lang','url'}] — 'playerjsSubtitle = "[Label]url'"."""
+    """player page -> [{'lang','url'}].
+
+    v1.8.1 fix: the attribute packs MULTIPLE comma-separated tracks —
+    'URL1,[English]URL2,[English]URL3' — and the old regex swallowed
+    the whole blob into one bogus URL (every player-side sub load
+    404'd/403'd). Split into individual tracks, keep only the ones
+    that answer a tiny ranged GET, emit ISO-639-1 lang codes ('en')."""
     try:
         r = _get(player_url, timeout=8, referer=SITE + "/")
-        out = []
-        for label, url in re.findall(
-                r'playerjs\w*[Ss]ubtitle\w*\s*=\s*"\[([^\]]+)\](https?://[^"]+)"',
-                r.text):
-            lang = "eng" if "eng" in label.lower() else _norm(label)[:3]
-            out.append({"url": url, "lang": lang or "eng", "id": "adk-" + (lang or "eng")})
+        out, seen = [], set()
+        for m in re.finditer(
+                r'playerjs\w*[Ss]ubtitle\w*\s*=\s*"([^"]+)"', r.text):
+            blob = m.group(1)
+            for label, u in re.findall(
+                    r'(?:\[([^\]]*)\])?(https?://[^,\[\]]+)', blob):
+                u = u.strip()
+                if not u or u in seen or not _sub_alive(u):
+                    continue
+                seen.add(u)
+                lg = "en" if "eng" in (label or "").lower() else (
+                     _norm(label)[:2] or "en")
+                out.append({"url": u, "lang": lg, "id": "adk-" + lg})
+                if len(out) >= 4:             # plenty for any player
+                    return out
         return out
     except Exception:
         return []

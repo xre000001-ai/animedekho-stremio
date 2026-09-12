@@ -201,10 +201,11 @@ def test_embed_iframe_missing():
         assert addon._embed_iframe("x") is None
 
 def test_player_subs():
-    with mock.patch.object(addon, "_get", return_value=R(PLAYER_HTML)):
+    with mock.patch.object(addon, "_get", return_value=R(PLAYER_HTML)), \
+         mock.patch.object(addon, "_sub_alive", return_value=True):
         subs = addon._player_subs("https://as-cdn26.top/video/x")
     assert len(subs) == 1
-    assert subs[0]["lang"] == "eng" and subs[0]["url"].endswith(".jpg")
+    assert subs[0]["lang"] == "en" and subs[0]["url"].endswith(".jpg")  # v1.8.1
 
 def test_player_subs_none():
     with mock.patch.object(addon, "_get", return_value=R("<script>var x=1;</script>")):
