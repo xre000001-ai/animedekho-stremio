@@ -41,7 +41,8 @@ import re
 import threading
 import time
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import (ThreadPoolExecutor, as_completed,
+                                TimeoutError as FuturesTimeoutError)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote, unquote, urljoin
 
@@ -50,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 BRAND   = "AnimeDekho"
 PORT    = int(os.environ.get("PORT", "7000"))
 PUBLIC_URL = os.environ.get("ADK_PUBLIC_URL", "").rstrip("/")
@@ -258,11 +259,14 @@ class _DeadResponse:
         raise ValueError("dead response")
 
 _CDN_RE = re.compile(r"https://as-cdn\d+\.top/")
-# v1.6.0: trdekho player-host families — same egress treatment as the
-# site itself (direct-first, pool only on a real 403 block)
-_PLAYER_HOSTS = ("vidmoly.biz", "vidmoly.me", "vidmoly.host",
-                 "emturbovid.com", "turboviplay.com", "vmnow.online",
-                 "abyssplayer.com", "xerver.xyz", "rubystm.com", "upns.one")
+# v1.6.1: trdekho OPEN player hosts (vidmoly/emturbo embeds, masters,
+# VTT subs) — verified open cross-IP, so they get the as-cdn treatment:
+# direct tried, NEVER benched, pool only as a 403 fallback. This keeps
+# the player chain fast on prod, where the site family must crawl
+# through pool proxies (v1.6.0 gave them fam_site routing and the
+# 20s wall was missed — 20.5s prod timing, zero cards).
+_PLAYER_OPEN = ("vidmoly.", "emturbovid.com", "turboviplay.com",
+                "vmnow.online", "srt.vidmoly.me")
 
 def _get(url, timeout=8, referer=None):
     # plain requests (no shared-session locking): the site needs NO cookies,
@@ -277,9 +281,8 @@ def _get(url, timeout=8, referer=None):
     hd = {"User-Agent": UA}
     if referer:
         hd["Referer"] = referer
-    fam_cdn = bool(_CDN_RE.match(url))
-    fam_site = ("animedekho.app" in url
-               or any(h in url for h in _PLAYER_HOSTS))
+    fam_cdn = bool(_CDN_RE.match(url)) or any(h in url for h in _PLAYER_OPEN)
+    fam_site = "animedekho.app" in url
     if not fam_cdn and not fam_site:
         return _S.get(url, headers=hd, timeout=timeout)
     now = time.time()
@@ -1032,8 +1035,11 @@ def _resolve_trservers(site_title, tr_servers, post_id, year,
                              args=(site_title, tr_servers, post_id,
                                    year), daemon=True).start()
             return ent[1]
-    if deadline is None:
-        deadline = time.time() + 10
+    # v1.6.1: own minimum budget — the trdekho pages are site-family
+    # (pool-proxied on prod, several seconds each), so a caller passing
+    # a nearly-spent build wall must not starve this chain.
+    if deadline is None or deadline < time.time() + 14:
+        deadline = time.time() + 14
 
     def _iframe(u):
         try:
@@ -1043,27 +1049,47 @@ def _resolve_trservers(site_title, tr_servers, post_id, year,
         except Exception:
             return None
 
-    players = [p for p in _IO_EX.map(_iframe, tr_servers) if p]
-    tagged = sorted(
-        ((_tr_fam_tag(p), p) for p in players if _tr_fam_tag(p)),
-        key=lambda t: _TR_PRIO.get(t[0], 9))
+    # v1.6.1: consume player pages AS THEY LAND (map's ordered iterator
+    # stalled behind the slowest pool fetch) and bail out as soon as two
+    # cards are built — the wall clock is dominated by the 9 pool
+    # fetches, not the (direct, fast) player chains.
+    futs = {_IO_EX.submit(_iframe, u): u for u in tr_servers}
     out, seen = [], set()
-    for fam, p in tagged:
-        if len(out) >= 2 or time.time() >= deadline:
-            break
-        master, subs = _player_master(p)
-        if not master:
-            continue
-        noq = master.split("?", 1)[0]
-        if noq in seen:
-            continue
-        seen.add(noq)
-        card = _card_from_master(site_title, fam, master, subs or [], year)
-        if card:
-            out.append(card)
+    timed_out = False
+    try:
+        for f in as_completed(futs, timeout=max(1.0, deadline - time.time())):
+            if len(out) >= 2 or time.time() >= deadline:
+                break
+            try:
+                p = f.result()
+            except Exception:
+                p = None
+            if not p:
+                continue
+            fam = _tr_fam_tag(p)
+            if not fam:
+                continue               # uncracked player host
+            master, subs = _player_master(p)
+            if not master:
+                continue
+            noq = master.split("?", 1)[0]
+            if noq in seen:
+                continue
+            seen.add(noq)
+            card = _card_from_master(site_title, fam, master, subs or [],
+                                     year)
+            if card:
+                out.append((fam, card))
+    except FuturesTimeoutError:
+        timed_out = True
+    out.sort(key=lambda fc: _TR_PRIO.get(fc[0], 9))
+    out = [c for _fam, c in out]
     if not force:
-        _cache_put(_CARD_CACHE, ckey, out or None,
-                   _CARD_TTL if out else _NEG_TTL)
+        # a timeout-induced empty result must NOT be negative-cached —
+        # the very next tap deserves a fresh try on a warm pool
+        if out or not timed_out:
+            _cache_put(_CARD_CACHE, ckey, out or None,
+                       _CARD_TTL if out else _NEG_TTL)
         if out:
             if len(_CARD_STALE) >= _STALE_SWEEP_AT:
                 now = time.time()
