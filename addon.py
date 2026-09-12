@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 BRAND   = "AnimeDekho"
 ADDON_NAME = "ΛNIME | VERSE"      # v1.7.0 user-named brand
 ADDON_LOGO = "https://i.postimg.cc/pXvhmfg1/Chat-GPT-Image-Sep-12-2026-11-32-08-AM.png"
@@ -186,7 +186,6 @@ _POOL_SRC = os.environ.get(
     "https://api.proxyscrape.com/v4/free-proxy-list/get"
     "?request=display_proxies&proxy_format=protocolipport&format=text",
 ).strip()
-_POOL_EXEMPT = ("v3-cinemeta.strem.io", "api.themoviedb.org")
 _FREE_POOL = [[]]                 # alive free exits (http://ip:port)
 _POOL_BAD = {}                    # url -> benched-until ts
 _POOL_STICKY = [None, 0.0]        # last good exit, sticky-until ts
@@ -907,8 +906,6 @@ def _server_fam(master_url):
         if fam in h:
             return fam
     return h.split(".")[0] or None
-
-_CARD_GROUP = ADDON_NAME   # v1.7.1: ⌗ carries the addon name
 
 def _fmt_stream_card(site_title, info, subs, ctype, se, ep, year,
                      fam=None):
