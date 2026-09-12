@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.9.1"
+VERSION = "1.9.3"
 BRAND   = "AnimeDekho"
 ADDON_NAME = "ΛNIME | VERSE"      # v1.7.0 user-named brand
 ADDON_LOGO = "https://i.postimg.cc/pXvhmfg1/Chat-GPT-Image-Sep-12-2026-11-32-08-AM.png"
@@ -1410,18 +1410,28 @@ def _build_inner(ctype, imdb, se, ep, deadline=None):
         worker = _one_movie
     cards = []
     if matched:
+        # v1.9.2 (user: "joto fast kora jay"): answer the moment the
+        # FIRST candidate lands cards — the old loop waited for each
+        # future in order, so a slow first candidate held ready cards
+        # from later ones hostage. Losing workers keep running; their
+        # cards land in _CARD_CACHE for the next tap.
         futs = [_IO_EX.submit(worker, c) for c in matched[:3]]
-        for f in futs:
+        first_ts = None                # v1.9.2: after the first cards
+        for f in as_completed(futs):   # land, wait max 2.5s for extras
+            if time.time() >= deadline:
+                break
+            if first_ts is not None and time.time() > first_ts + 2.5:
+                break
             try:
-                card = f.result(timeout=max(0.2, deadline - time.time()))
+                card = f.result(timeout=max(
+                    0.2, min(deadline,
+                             (first_ts or deadline) + 2.5) - time.time()))
             except Exception:
                 card = None
             if card:
                 cards.extend(card)      # v1.6.0: workers return lists
-            if time.time() >= deadline:
-                for f2 in futs:
-                    f2.cancel()
-                break
+                if first_ts is None:
+                    first_ts = time.time()
     for i in range(1, len(cards)):          # name the extras as alternates
         cards[i]["name"] += " · alt"
     if not cards:
