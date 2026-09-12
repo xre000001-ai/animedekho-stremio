@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.7.1"
+VERSION = "1.8.0"
 BRAND   = "AnimeDekho"
 ADDON_NAME = "ΛNIME | VERSE"      # v1.7.0 user-named brand
 ADDON_LOGO = "https://i.postimg.cc/pXvhmfg1/Chat-GPT-Image-Sep-12-2026-11-32-08-AM.png"
@@ -262,14 +262,15 @@ class _DeadResponse:
         raise ValueError("dead response")
 
 _CDN_RE = re.compile(r"https://as-cdn\d+\.top/")
-# v1.6.1: trdekho OPEN player hosts (vidmoly/emturbo embeds, masters,
+# v1.6.1: trdekho OPEN player hosts (emturbo embeds, masters,
 # VTT subs) — verified open cross-IP, so they get the as-cdn treatment:
 # direct tried, NEVER benched, pool only as a 403 fallback. This keeps
 # the player chain fast on prod, where the site family must crawl
 # through pool proxies (v1.6.0 gave them fam_site routing and the
 # 20s wall was missed — 20.5s prod timing, zero cards).
-_PLAYER_OPEN = ("vidmoly.", "emturbovid.com", "turboviplay.com",
-                "vmnow.online", "srt.vidmoly.me")
+# v1.8.0: vidmoly REMOVED (user directive) — its master token is
+# minting-IP-bound anyway, so user players blank on the segments.
+_PLAYER_OPEN = ("emturbovid.com", "turboviplay.com", "vmnow.online")
 
 def _get(url, timeout=8, referer=None):
     # plain requests (no shared-session locking): the site needs NO cookies,
@@ -873,7 +874,7 @@ def _server_fam(master_url):
         h = (urlparse(master_url).hostname or "").lower().strip(".")
     except Exception:
         return None
-    for fam in ("emturbovid", "vidmoly", "xerver", "filesforever",
+    for fam in ("emturbovid", "xerver", "filesforever",
                 "rubystm", "abyss", "cloudy", "upns"):
         if fam in h:
             return fam
@@ -890,7 +891,7 @@ def _fmt_stream_card(site_title, info, subs, ctype, se, ep, year,
         ◈ WEB-DL ♫ AAC ◉ 2.0
         ◈ Hindi · English
         ⌗ ΛNIME | VERSE
-        ⌬ vidmoly  ◴ 2026 ⟡ 1 SUB
+        ⌬ emturbo  ◴ 2026 ⟡ 1 SUB
 
     Every token is real data parsed from the HLS master; anything we
     don't have is dropped honestly, never faked."""
@@ -951,6 +952,9 @@ def _resolve_card(site_title, embed_url, ctype, se, ep, year,
     if not force:
         hit, card = _cache_get(_CARD_CACHE, ckey)
         if hit:
+            if not card:                      # v1.8.0: pinned empty answer
+                _neg_bg_retry(ckey, _card_refresh,
+                              site_title, embed_url, ctype, se, ep, year)
             return card
         ent = _CARD_STALE.get(ckey)
         if ent and ent[0] > time.time() and ent[1]:
@@ -1037,9 +1041,7 @@ def _get_alt_exit(url, timeout=8, referer=None):
 
 def _player_master(player_url):
     """player iframe url -> (master_url, subs) | (None, None).
-    Dispatch: as-cdnN.top keeps the v1.2.0 getVideo POST chain; vidmoly
-    embeds carry the signed master LITERALLY in the page (12h token,
-    absolute variant/audio urls — open cross-IP) + srt.vidmoly.me subs;
+    Dispatch: as-cdnN.top keeps the v1.2.0 getVideo POST chain;
     emturbovid carries a tokenless turboviplay master literally. The
     other trdekho hosts (abyssplayer, xerver, rubystm, upns,
     filesforever) assemble sources at runtime behind anti-debug checks —
@@ -1048,26 +1050,8 @@ def _player_master(player_url):
         if _CDN_RE.match(player_url):
             vid = player_url.split("/video/")[-1]
             return _get_video(player_url, vid), []
-        if "vidmoly" in player_url:
-            r = _get(player_url, timeout=8, referer=SITE + "/")
-            m = re.search(r'(https://[^\s"\'\\]+\.m3u8\?[^\s"\'\\]+)',
-                          r.text or "")
-            if not m:
-                return None, None
-            subs = []
-            for label, su in re.findall(
-                    r'playerjs\w*[Ss]ubtitle\w*\s*=\s*"\[([^\]]+)\](https?://[^"]+)"',
-                    r.text or ""):
-                lang = "eng" if "eng" in label.lower() else _norm(label)[:3]
-                subs.append({"url": su, "lang": lang or "eng",
-                             "id": "vm-" + (lang or "eng")})
-            if not subs:
-                su = re.search(r'(https?://srt\.vidmoly\.me/[^\s"\'\\]+\.vtt)',
-                               r.text or "")
-                if su:
-                    subs.append({"url": su.group(1), "lang": "eng",
-                                 "id": "vm-eng"})
-            return m.group(1), subs
+        # v1.8.0: the vidmoly branch is GONE (user directive —
+        # remove vidmoly completely; its token was minting-IP-bound).
         if "emturbovid" in player_url or "turboviplay" in player_url:
             # v1.6.5: a 200 stub page means THIS egress IP is bot-walled —
             # rotate pool exits until the master literal shows up
@@ -1088,14 +1072,12 @@ def _player_master(player_url):
     except Exception:
         return None, None
 
-_TR_FAM_TAG = (("vidmoly", "vidmoly"), ("emturbovid", "emturbo"),
-               ("turboviplay", "emturbo"), ("as-cdn", "cdn"))
+_TR_FAM_TAG = (("emturbovid", "emturbo"), ("turboviplay", "emturbo"),
+               ("as-cdn", "cdn"))
 # v1.6.7: emturbo FIRST — its GDrive segments are IP-free and always
-# play, while the vidmoly master token is minting-IP-bound (verified:
-# prod-minted token 200s from the minting IP, 403 from any other, even
-# token-stripped/referer/chrome-UA) — a user's player would blank on
-# vidmoly segments, so the always-playable card must be the default.
-_TR_PRIO = {"emturbo": 0, "vidmoly": 1, "cdn": 2}
+# play. v1.8.0: vidmoly removed entirely (user directive; its master
+# token was minting-IP-bound, so the card was unreliable anyway).
+_TR_PRIO = {"emturbo": 0, "cdn": 1}
 
 def _tr_fam_tag(u):
     for k, v in _TR_FAM_TAG:
@@ -1126,16 +1108,33 @@ def _tr_refresh(site_title, tr_servers, post_id, year):
     except Exception:
         pass
 
+_NEG_RETRY_AT = {}                     # ckey -> next allowed bg retry
+_NEG_RETRY_CD = 120.0                  # v1.8.0: throttle per title
+
+def _neg_bg_retry(ckey, fn, *args):
+    """v1.8.0: a cached EMPTY answer re-resolves in the background
+    (throttled) so the user's very next tap can find the card — the
+    'title shows nothing' complaint was a cold-pool miss pinned for
+    _NEG_TTL seconds."""
+    now = time.time()
+    if _NEG_RETRY_AT.get(ckey, 0) > now:
+        return
+    _NEG_RETRY_AT[ckey] = now + _NEG_RETRY_CD
+    threading.Thread(target=fn, args=args, daemon=True).start()
+
 def _resolve_trservers(site_title, tr_servers, post_id, year,
                        force=False, deadline=None):
     """trdekho server pages -> up to 2 extra cards.
     All player pages fetch in parallel; resolvable players run in
-    priority order (vidmoly > emturbo > as-cdn), deduped by master
+    priority order (emturbo > as-cdn), deduped by master
     (query-stripped). Cached + SWR under ('tr'+post_id, 1, 1)."""
     ckey = ("tr" + str(post_id or "?"), 1, 1)
     if not force:
         hit, cards = _cache_get(_CARD_CACHE, ckey)
         if hit:
+            if not cards:
+                _neg_bg_retry(ckey, _tr_refresh,
+                              site_title, tr_servers, post_id, year)
             return cards
         ent = _CARD_STALE.get(ckey)
         if ent and ent[0] > time.time() and ent[1]:
@@ -1151,10 +1150,8 @@ def _resolve_trservers(site_title, tr_servers, post_id, year,
 
     def _iframe(u):
         try:
-            # v1.6.3: 12s — with pool-proxied trdekho pages, the old 8s
-            # cut the OTHER resolvable slots (emturbo) off at exactly the
-            # moment the first (vidmoly) landed, caching just 1 card
-            r = _get(u, timeout=12, referer=SITE + "/")
+            # v1.8.0: 9s (vidmoly gone, emturbo-first chains are short)
+            r = _get(u, timeout=9, referer=SITE + "/")
             m = re.search(r'<iframe[^>]*\ssrc="([^"]+)"', r.text or "")
             return m.group(1) if m else None
         except Exception:
@@ -1171,7 +1168,7 @@ def _resolve_trservers(site_title, tr_servers, post_id, year,
     chain_futs = {}                     # chain future -> family tag
     out, seen = [], set()
     timed_out = False
-    page_deadline = min(deadline, time.time() + 8)
+    page_deadline = min(deadline, time.time() + 6)   # v1.8.0: faster
     try:
         for f in as_completed(page_futs,
                               timeout=max(1.0, page_deadline - time.time())):
@@ -1186,10 +1183,13 @@ def _resolve_trservers(site_title, tr_servers, post_id, year,
                 chain_futs[_IO_EX.submit(_player_master, p)] = fam
     except FuturesTimeoutError:
         pass
-    try:
+    first_card_ts = None                    # v1.8.0: after the first card
+    try:                                     # lands, wait max 3s for a 2nd
         for f in as_completed(list(chain_futs),
                               timeout=max(0.5, deadline - time.time())):
             if len(out) >= 2 or time.time() >= deadline:
+                break
+            if first_card_ts and time.time() > first_card_ts + 3:
                 break
             fam = chain_futs[f]
             try:
@@ -1206,6 +1206,8 @@ def _resolve_trservers(site_title, tr_servers, post_id, year,
                                      year)
             if card:
                 out.append((fam, card))
+                if first_card_ts is None:
+                    first_card_ts = time.time()
     except FuturesTimeoutError:
         timed_out = True
     out.sort(key=lambda fc: _TR_PRIO.get(fc[0], 9))
