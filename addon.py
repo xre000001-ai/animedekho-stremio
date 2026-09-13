@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.9.8"
+VERSION = "1.9.9"
 BRAND   = "AnimeDekho"
 ADDON_NAME = "ΛNIME | VERSE"      # v1.7.0 user-named brand
 ADDON_LOGO = "https://i.postimg.cc/pXvhmfg1/Chat-GPT-Image-Sep-12-2026-11-32-08-AM.png"
@@ -1929,7 +1929,7 @@ class Handler(BaseHTTPRequestHandler):
                         return self._send(400, json.dumps({"error": "url"}))
                     t = mu.group(1).replace("-", " ")
                 tr["title"] = t
-                cands = _search_candidates(t)
+                cands = search_candidates(t)
                 tr["search"] = "%d cands %.1fs %s" % (
                     len(cands), time.time() - t0,
                     (cands[0][0][:48] if cands else "-"))
