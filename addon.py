@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "2.2.2"
+VERSION = "2.2.3"
 BRAND   = "AnimeDekho"
 ADDON_NAME = "ΛNIME | VERSE"      # v1.7.0 user-named brand
 ADDON_LOGO = "https://i.postimg.cc/pXvhmfg1/Chat-GPT-Image-Sep-12-2026-11-32-08-AM.png"
@@ -1699,6 +1699,19 @@ def _swr_refresh(ctype, imdb, se, ep, key):
 # --------------------------------------------------------------------------
 # 7. keep-alive (anti-sleep; auto-armed from the first public Host header)
 # --------------------------------------------------------------------------
+def _pool_warm_loop():
+    """v2.2.3: keep the free-exit pool warm. A fresh deploy starts with
+    an EMPTY pool; the first user tap then paid the ~25s rebuild wait
+    inside every site _get and the build blew the 20s wall ('AnimeDekho
+    is slow'). This daemon rebuilds at boot and tops the pool up on the
+    normal cadence so taps always find live exits."""
+    while True:
+        try:
+            _pool_refresh(force=True)
+        except Exception:
+            pass
+        time.sleep(200 if _FREE_POOL[0] else 30)
+
 _KEEPALIVE_URL = None
 _KEEPALIVE_LOCK = threading.Lock()
 
@@ -2009,7 +2022,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not cands:
                     return self._send(200, json.dumps(tr))
                 t1 = time.time()
-                pg = _parse_movie_page(cands[0][1])
+                pg = _parse_movie_page(cands[0]["url"])
                 tr["page_ms"] = int((time.time() - t1) * 1000)
                 tr["page"] = ("embed=%s tr=%d post=%s" % (
                     pg.get("embed"), len(pg.get("tr_servers") or []),
@@ -2238,6 +2251,7 @@ def main():
     threading.Thread(target=_pool_refresh, kwargs={"force": True},
                      daemon=True).start()
     threading.Thread(target=_prewarm_loop, daemon=True).start()
+    threading.Thread(target=_pool_warm_loop, daemon=True).start()   # v2.2.3
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print("%s %s listening on :%d (strict zero-bandwidth)" % (BRAND, VERSION, PORT),
           flush=True)
