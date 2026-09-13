@@ -415,11 +415,6 @@ def test_stream_route_regex():
     assert not rx.match("/stream/series/tt123-2-3.json")
 
 
-if __name__ == "__main__":
-    fns = [v for k, v in sorted(globals().items())
-           if k.startswith("test_") and callable(v)]
-    run(fns)
-    print("\n%d/%d tests passed" % (PASS, len(fns)))
 
 
 # --- v1.0.1: the Render-edge hang (Content-Length sent pre-gzip) ---------------
@@ -478,10 +473,16 @@ def test_v101_gzip_content_length_consistency():
         assert int(hdrs[b"content-length"]) == len(body), (
             "CL %s != body %d (the v1.0.0 bug)" % (hdrs[b"content-length"], len(body)))
         assert gzmod.decompress(body).decode().startswith("<!doctype html>")
-        # gzip ON but small json (<512B): NOT gzipped, still consistent
+        # gzip ON for json too (the manifest grew past the 512B threshold
+        # in v1.9.x): the v1.0.1 invariant is CL == wire bytes + a valid
+        # body, gzipped or not
         code, hdrs, body = _srv_sock_request(port, "/manifest.json", accept_gzip=True)
-        assert code == 200 and b"content-encoding" not in hdrs
+        assert code == 200
         assert int(hdrs[b"content-length"]) == len(body)
+        if hdrs.get(b"content-encoding") == b"gzip":
+            json.loads(gzmod.decompress(body).decode())
+        else:
+            json.loads(body.decode())
         # plain (no Accept-Encoding): never gzipped, consistent
         code, hdrs, body = _srv_sock_request(port, "/", accept_gzip=False)
         assert code == 200 and b"content-encoding" not in hdrs
@@ -524,7 +525,7 @@ def test_v110_pool_used_when_direct_blocked():
             return _Resp(200, "ok-via-p1")
         raise ConnectionError("dead exit")
     with mock.patch.object(addon._S, "get", side_effect=fake_get):
-        addon._FREE_POOL[0] = ["http://dead:1", "http://p1:2"]
+        addon._FREE_POOL[0] = [("http://dead:1", 0.9), ("http://p1:2", 0.4)]
         # sticky forces dead:1 to be tried FIRST (deterministic, not 50/50)
         addon._POOL_STICKY[0] = "http://dead:1"
         addon._POOL_STICKY[1] = time.time() + 60
@@ -542,7 +543,7 @@ def test_v110_sticky_exit_reused():
         n[0] += 1
         return _Resp(200, "x")
     with mock.patch.object(addon._S, "get", side_effect=fake_get):
-        addon._FREE_POOL[0] = ["http://a:1", "http://b:2"]
+        addon._FREE_POOL[0] = [("http://a:1", 0.9), ("http://b:2", 0.4)]
         addon._POOL_STICKY[0] = "http://b:2"
         addon._POOL_STICKY[1] = time.time() + 60
         r1 = addon._get("https://animedekho.app/?s=one")
@@ -576,7 +577,7 @@ def test_v110_direct_403_benches_and_falls_to_pool():
             return _Resp(403, "dc-blocked")
         return _Resp(200, "via-pool")
     with mock.patch.object(addon._S, "get", side_effect=fake_get):
-        addon._FREE_POOL[0] = ["http://p:1"]
+        addon._FREE_POOL[0] = [("http://p:1", 0.4)]
         r = addon._get("https://animedekho.app/?s=demon")
     assert r.text == "via-pool"
     assert seq[0] is None and seq[1] is not None    # direct first, then pool
@@ -672,7 +673,7 @@ def test_v120_cdn_never_benches_direct():
         calls.append(proxies)
         return R403() if proxies is None else R200()
     with mock.patch.object(addon._S, "get", side_effect=fake_get):
-        addon._FREE_POOL[0] = ["http://p:1"]
+        addon._FREE_POOL[0] = [("http://p:1", 0.4)]
         r = addon._get("https://as-cdn26.top/cdn/hls/abc/master.m3u8?md5=x&expires=1")
     assert r.status_code == 200                        # served via pool exit
     assert addon._DIRECT_OK_UNTIL[0] > time.time()     # NOT benched (cdn family)
@@ -809,7 +810,11 @@ def test_v130_stream_route_accepts_kitsu_ids():
             code, hdrs, body = _srv_sock_request(
                 port, "/stream/series/kitsu:1376:1:1.json", False)
         assert code == 200
-        assert bs.call_args[0] == ("series", "kitsu:1376", 1, 1)
+        # v1.9.4: a successful series answer ALSO fires a background
+        # build_streams(ep+1) binge-prefetch — judge the ROUTE by its
+        # first call, not the last
+        calls = [tuple(c[0]) for c in bs.call_args_list]
+        assert ("series", "kitsu:1376", 1, 1) in calls, calls
         d = json.loads(body.decode())
         assert d["streams"][0]["url"].startswith("https://127.0.0.1:")  # absolutized
         assert "/hls/" in d["streams"][0]["url"]
@@ -889,3 +894,101 @@ def test_v140_token_subset_matching():
     # exact still wins
     m3 = addon._match_candidates(cands[1:], "Naruto Shippuden", "series-hindi")
     assert m3 and m3[0]["title"] == "Naruto Shippuden"
+
+
+# --- v1.9.5: blakiteapi (trdekho slot) — Rumble-backed direct source ---------
+
+BLAKITE_API_JSON = {
+    "success": True,
+    "data": {
+        "animeTitle": "Demon Slayer: Kimetsu no Yaiba Infinity Castle (Hindi Dubbed)",
+        "tmdbId": "1311031", "type": "Movie", "language": "ORG",
+        "dataId": "fww1/fb/s8/2/K/R/B/K/KRBKA", "qid": 5,
+        "quality": "480p", "format": "M3U8",
+        "ranges": ("258746880-258839413 (240p)\n782270976-782364008 (360p)\n"
+                   "1218316288-1218409766 (480p)\n2474653696-2474748032 (720p)\n"
+                   "4763655168-4763749878 (1080p)"),
+        "poster": "https://image.tmdb.org/t/p/w500/x.jpg",
+    },
+    "debug": {},
+}
+
+class _BKResp:
+    def __init__(self, status=200, text="", jdict=None):
+        self.status_code = status
+        self.text = text
+        self._j = jdict
+    def json(self):
+        if self._j is None:
+            raise ValueError("no json")
+        return self._j
+
+def test_v195_blakite_best_quality_direct_card():
+    """blakiteapi: API ranges -> BEST (1080p) chunklist card, url DIRECT
+    (rumble CDN, no /hls relay), name carries FHD 1080p + blakite fam."""
+    _reset()
+    def fake_get(url, timeout=10, referer=None):
+        if "api/get.php" in url:
+            assert "tmdbId=1311031" in url
+            return _BKResp(jdict=BLAKITE_API_JSON)
+        if "chunklist.m3u8" in url:
+            assert url.startswith("https://hugh.cdn.rumble.cloud/video/fww1/fb/s8/2/K/R/B/K/KRBKA.haa.tar?"), url
+            assert "r_range=4763655168-4763749878" in url
+            return _BKResp(text="#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:10,\nseg\n")
+        raise AssertionError("unexpected fetch: " + url)
+    with mock.patch.object(addon, "_get", side_effect=fake_get):
+        card = addon._blakite_resolve("https://blakiteapi.xyz/embed/1311031",
+                                      "Demon Slayer Infinity Castle", 2025)
+    assert card, "card must build from a live-looking API answer"
+    assert card["url"].startswith("https://hugh.cdn.rumble.cloud/video/")
+    assert "/hls/" not in card["url"], "blakite is open — direct url, no relay"
+    assert "FHD 1080p" in card["name"]
+    assert "blakite" in card["description"]
+    assert card["behaviorHints"]["notWebReady"] is False
+    assert card["bingeGroup"] == "adk|Demon Slayer Infinity Castle|blakite"
+
+def test_v195_blakite_dead_chunklist_is_honestly_skipped():
+    """no phantom cards: a dead/unverified chunklist -> no card at all."""
+    _reset()
+    def fake_get(url, timeout=10, referer=None):
+        if "api/get.php" in url:
+            return _BKResp(jdict=BLAKITE_API_JSON)
+        return _BKResp(status=403, text="Forbidden")
+    with mock.patch.object(addon, "_get", side_effect=fake_get):
+        assert addon._blakite_resolve("https://blakiteapi.xyz/embed/1311031",
+                                      "T", 2025) is None
+
+def test_v195_blakite_fallback_quality_when_1080_missing():
+    """canonical quality order: when 1080p is absent the next best wins."""
+    _reset()
+    d = dict(BLAKITE_API_JSON)
+    d = json.loads(json.dumps(d))
+    d["data"]["ranges"] = ("782270976-782364008 (360p)\n2474653696-2474748032 (720p)")
+    def fake_get(url, timeout=10, referer=None):
+        if "api/get.php" in url:
+            return _BKResp(jdict=d)
+        assert ".gaa.tar?" in url and "r_range=2474653696-2474748032" in url, url
+        return _BKResp(text="#EXTM3U\n#EXTINF:9,\nx\n")
+    with mock.patch.object(addon, "_get", side_effect=fake_get):
+        card = addon._blakite_resolve("https://blakiteapi.xyz/embed/1311031",
+                                      "T", 2025)
+    assert card and "HD 720p" in card["name"]
+
+def test_v195_blakite_fam_tag_priority_and_dispatch():
+    """the trdekho family map recognises blakite and orders it after
+    emturbo, before the gated cdn; _player_master still honest-skips
+    unknown hosts."""
+    assert addon._tr_fam_tag("https://blakiteapi.xyz/embed/1311031") == "blakite"
+    assert addon._TR_PRIO["emturbo"] < addon._TR_PRIO["blakite"] < addon._TR_PRIO["cdn"]
+    # non-numeric id -> honest skip
+    _reset()
+    with mock.patch.object(addon, "_get") as g:
+        assert addon._blakite_resolve("https://blakiteapi.xyz/embed/abc", "T", 2025) is None
+        g.assert_not_called()
+
+
+if __name__ == "__main__":
+    fns = [v for k, v in sorted(globals().items())
+           if k.startswith("test_") and callable(v)]
+    run(fns)
+    print("\n%d/%d tests passed" % (PASS, len(fns)))

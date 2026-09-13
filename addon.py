@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.9.4"
+VERSION = "1.9.5"
 BRAND   = "AnimeDekho"
 ADDON_NAME = "ΛNIME | VERSE"      # v1.7.0 user-named brand
 ADDON_LOGO = "https://i.postimg.cc/pXvhmfg1/Chat-GPT-Image-Sep-12-2026-11-32-08-AM.png"
@@ -272,7 +272,11 @@ _CDN_RE = re.compile(r"https://as-cdn\d+\.top/")
 # 20s wall was missed — 20.5s prod timing, zero cards).
 # v1.8.0: vidmoly REMOVED (user directive) — its master token is
 # minting-IP-bound anyway, so user players blank on the segments.
-_PLAYER_OPEN = ("emturbovid.com", "turboviplay.com", "vmnow.online")
+# v1.9.5: blakiteapi (trdekho slot 12) — its API + the Rumble CDN
+# it fronts are open cross-IP (verified 2026-09-13: plain fetch,
+# CORS *, Range-honoured), so they get the same open-host class.
+_PLAYER_OPEN = ("emturbovid.com", "turboviplay.com", "vmnow.online",
+                "blakiteapi.xyz", "rumble.cloud")
 
 def _get(url, timeout=8, referer=None):
     # plain requests (no shared-session locking): the site needs NO cookies,
@@ -1097,12 +1101,68 @@ def _player_master(player_url):
     except Exception:
         return None, None
 
+# v1.9.5: blakiteapi.xyz (trdekho slot 12) — a premium-style streaming
+# API the site leans on for newer movie posts. The embed id IS the site's
+# own post id; GET /api/get.php?tmdbId={id} answers {dataId, format,
+# ranges}. Every quality is a byte-range slice of ONE big .tar archive on
+# the Rumble CDN exposing chunklist.m3u8 — a media playlist whose segment
+# URIs are relative, so the player resolves them against the chunklist
+# URL. Verified open (2026-09-13): plain cookie-less fetch, CORS *,
+# Range-honoured segments -> the card points DIRECTLY at the best
+# chunklist: zero addon bytes, no /hls relay, survives restarts.
+_BLAKITE_CDN = "https://hugh.cdn.rumble.cloud/video/"
+_BLAKITE_CODES = {"240p": "oaa", "360p": "baa", "480p": "caa",
+                  "720p": "gaa", "1080p": "haa"}
+
+def _blakite_resolve(embed_url, site_title, year):
+    """blakiteapi embed url -> one verified DIRECT card (best quality)."""
+    try:
+        rid = (embed_url or "").rstrip("/").rsplit("/", 1)[-1]
+        if not rid.isdigit():
+            return None
+        r = _get("https://blakiteapi.xyz/api/get.php?tmdbId=" + rid,
+                 timeout=8, referer=embed_url)
+        if r.status_code != 200:
+            return None
+        d = (r.json() or {}).get("data") or {}
+        data_id = d.get("dataId")
+        ranges = d.get("ranges") or ""
+        if not data_id or d.get("format") != "M3U8":
+            return None
+        qmap = {}
+        for ln in ranges.split("\n"):
+            m = re.match(r"^(\d+-\d+)\s*\((\d+p)\)", ln.strip())
+            if m:
+                qmap[m.group(2)] = m.group(1)
+        best = next((q for q in ("1080p", "720p", "480p", "360p", "240p")
+                     if q in qmap), None)
+        if not best:
+            return None
+        url = ("%s%s.%s.tar?r_file=chunklist.m3u8"
+               "&r_type=application%%2Fvnd.apple.mpegurl&r_range=%s"
+               % (_BLAKITE_CDN, data_id, _BLAKITE_CODES[best], qmap[best]))
+        rv = _get(url, timeout=8)          # no phantom cards — verify now
+        if rv.status_code != 200 or "#EXTM3U" not in (rv.text or "")[:64]:
+            return None
+        h = int(best[:-1])
+        name, desc = _fmt_stream_card(
+            site_title, {"res": [h], "langs": [], "audio_rends": []},
+            [], "movie", 1, 1, year, fam="blakite")
+        return {"name": name, "description": desc, "url": url,
+                "behaviorHints": {"notWebReady": False,
+                                  "isBingeable": True},
+                "bingeGroup": "adk|%s|blakite" % site_title}
+    except Exception:
+        return None
+
 _TR_FAM_TAG = (("emturbovid", "emturbo"), ("turboviplay", "emturbo"),
-               ("as-cdn", "cdn"))
+               ("blakiteapi", "blakite"), ("as-cdn", "cdn"))
 # v1.6.7: emturbo FIRST — its GDrive segments are IP-free and always
 # play. v1.8.0: vidmoly removed entirely (user directive; its master
 # token was minting-IP-bound, so the card was unreliable anyway).
-_TR_PRIO = {"emturbo": 0, "cdn": 1}
+# v1.9.5: blakite joins the resolvable set (Rumble-backed chunklist,
+# fully open) — after emturbo (GDrive), before the gated cdn.
+_TR_PRIO = {"emturbo": 0, "blakite": 1, "cdn": 2}
 
 def _tr_fam_tag(u):
     for k, v in _TR_FAM_TAG:
@@ -1149,7 +1209,7 @@ def _neg_bg_retry(ckey, fn, *args):
 
 def _resolve_trservers(site_title, tr_servers, post_id, year,
                        force=False, deadline=None):
-    """trdekho server pages -> up to 2 extra cards.
+    """trdekho server pages -> up to 3 extra cards (v1.9.5: +blakite).
     All player pages fetch in parallel; resolvable players run in
     priority order (emturbo > as-cdn), deduped by master
     (query-stripped). Cached + SWR under ('tr'+post_id, 1, 1)."""
@@ -1205,22 +1265,34 @@ def _resolve_trservers(site_title, tr_servers, post_id, year,
                 p = None
             fam = _tr_fam_tag(p) if p else None
             if fam and len(chain_futs) < 4:
-                chain_futs[_IO_EX.submit(_player_master, p)] = fam
+                # v1.9.5: blakite builds its own (already verified) card
+                if fam == "blakite":
+                    chain_futs[_IO_EX.submit(_blakite_resolve, p,
+                                             site_title, year)] = fam
+                else:
+                    chain_futs[_IO_EX.submit(_player_master, p)] = fam
     except FuturesTimeoutError:
         pass
     first_card_ts = None                    # v1.8.0: after the first card
     try:                                     # lands, wait max 3s for a 2nd
         for f in as_completed(list(chain_futs),
                               timeout=max(0.5, deadline - time.time())):
-            if len(out) >= 2 or time.time() >= deadline:
+            if len(out) >= 3 or time.time() >= deadline:
                 break
             if first_card_ts and time.time() > first_card_ts + 3:
                 break
             fam = chain_futs[f]
             try:
-                master, subs = f.result()
+                fres = f.result()
             except Exception:
-                master, subs = None, None
+                fres = None
+            if fam == "blakite":           # v1.9.5: a ready card or None
+                if fres:
+                    out.append((fam, fres))
+                    if first_card_ts is None:
+                        first_card_ts = time.time()
+                continue
+            master, subs = fres or (None, None)
             if not master:
                 continue
             noq = master.split("?", 1)[0]
