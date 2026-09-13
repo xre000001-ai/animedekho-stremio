@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "2.2.4"
+VERSION = "2.2.5"
 BRAND   = "AnimeDekho"
 ADDON_NAME = "ΛNIME | VERSE"      # v1.7.0 user-named brand
 ADDON_LOGO = "https://i.postimg.cc/pXvhmfg1/Chat-GPT-Image-Sep-12-2026-11-32-08-AM.png"
@@ -1328,10 +1328,13 @@ def _resolve_trservers(site_title, tr_servers, post_id, year,
                              args=(site_title, tr_servers, post_id,
                                    year), daemon=True).start()
             return ent[1]
-    # v1.6.1: own minimum budget — the trdekho pages are site-family
-    # (pool-proxied on prod, several seconds each), so a caller passing
-    # a nearly-spent build wall must not starve this chain.
-    if deadline is None or deadline < time.time() + 18:
+    # v1.6.1/v2.2.5: background callers (prewarm/SWR, no deadline) get
+    # an own 18s budget. A deadline-bearing caller (the movie build) is
+    # now respected EXACTLY: since v2.2.0 the tr grid runs parallel to
+    # the embed chain and starts ~3s into the build, so it already sees
+    # ~17s of wall — the old always-extend-to-18s pushed the combined
+    # movie future past the 20s wall and the whole build read "slow".
+    if deadline is None:
         deadline = time.time() + 18
 
     def _iframe(u):
