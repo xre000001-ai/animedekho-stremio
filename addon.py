@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.9.7"
+VERSION = "1.9.8"
 BRAND   = "AnimeDekho"
 ADDON_NAME = "ΛNIME | VERSE"      # v1.7.0 user-named brand
 ADDON_LOGO = "https://i.postimg.cc/pXvhmfg1/Chat-GPT-Image-Sep-12-2026-11-32-08-AM.png"
@@ -1910,6 +1910,45 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._send(200, json.dumps(
                     {"error": "%s: %s" % (type(e).__name__, str(e)[:120])}))
+
+        if path == "/debug/build":
+            # v1.9.8 diagnostic: run the REAL movie build with a step
+            # trace — where exactly does the chain die on this host?
+            k = (q.get("k") or [""])[0]
+            t = (q.get("t") or [""])[0]
+            y = (q.get("y") or ["0"])[0]
+            u = (q.get("url") or [""])[0]
+            if k != "adk-dbg-9c2f" or not (t or u):
+                return self._send(404, json.dumps({"error": "not found"}))
+            tr = {"v": VERSION}
+            t0 = time.time()
+            try:
+                if u:
+                    mu = re.search(r"movie-hindi/([^/]+)/?", u)
+                    if not mu:
+                        return self._send(400, json.dumps({"error": "url"}))
+                    t = mu.group(1).replace("-", " ")
+                tr["title"] = t
+                cands = _search_candidates(t)
+                tr["search"] = "%d cands %.1fs %s" % (
+                    len(cands), time.time() - t0,
+                    (cands[0][0][:48] if cands else "-"))
+                if not cands:
+                    return self._send(200, json.dumps(tr))
+                pg = _parse_movie_page(cands[0][1])
+                tr["page"] = ("embed=%s tr=%d post=%s %.1fs" % (
+                    pg.get("embed"), len(pg.get("tr_servers") or []),
+                    pg.get("post_id"), time.time() - t0)) if pg else "FAIL"
+                if not pg:
+                    return self._send(200, json.dumps(tr))
+                dl = time.time() + 20
+                cards = _movie_cards(pg, t, int(y), deadline=dl)
+                tr["cards"] = "%d/%d" % (len(cards), 4)
+                tr["names"] = [c.get("name", "?")[:40] for c in cards]
+                tr["ms"] = int((time.time() - t0) * 1000)
+            except Exception as e:
+                tr["error"] = "%s: %s" % (type(e).__name__, str(e)[:120])
+            return self._send(200, json.dumps(tr))
 
         if path == "/debug/movie":
             # v1.9.7 diagnostic: movie-page gate forensics from THIS host
