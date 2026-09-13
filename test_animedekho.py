@@ -1159,6 +1159,80 @@ def test_v210_cdn_fetches_bypass_the_site_semaphore():
     assert time.time() - t0 < 1.5
 
 
+
+
+# --- v2.2.0: 206-gate + parallel movie cards ---------------------------------
+
+class _R206:
+    def __init__(self, code, cr):
+        self.status_code = code
+        self.headers = {"Content-Range": cr} if cr else {}
+    class raw:
+        @staticmethod
+        def read(n): return b"x" * min(n, 64)
+    def close(self): pass
+
+def test_v220_url_alive_need206_rejects_unseekable():
+    """xerver instant_dl blobs reply 200-full-body with no Accept-Ranges
+    ('No-Forward-Backward') — a 1.6GB unseekable video/mkv no player can
+    stream. need_206=True must reject them; 206+Content-Range passes."""
+    _reset()
+    with mock.patch.object(addon._S, "get",
+                           return_value=_R206(200, None)) as g:
+        assert addon._url_alive("https://x/f", need_206=True) is False
+        assert g.call_args[1]["headers"]["Range"] == "bytes=0-1023"
+    with mock.patch.object(addon._S, "get",
+                           return_value=_R206(206, "bytes 0-1023/999")):
+        assert addon._url_alive("https://x/f", need_206=True) is True
+    with mock.patch.object(addon._S, "get",
+                           return_value=_R206(200, None)):
+        # plain liveness (non-xerver use) still accepts 200
+        assert addon._url_alive("https://x/f") is True
+
+def test_v220_xerver_skips_unseekable_instant_dl():
+    """the googleusercontent instant_dl key fails the 206-gate -> no card
+    (no dead-click cards); a Range-honouring cloud_r2 still lands."""
+    _reset()
+    api = {"results": {
+        "instant_dl": {"url": "https://video-downloads.googleusercontent.com/x"},
+        "cloud_r2": {"url": "https://r2.example.com/f.mp4"}}}
+    alive = {}
+    def fake_alive(u, timeout=8, need_206=False):
+        alive[u] = need_206
+        return u.startswith("https://r2.")
+    with mock.patch.object(addon, "_get",
+                           return_value=_BKResp(jdict=api)), \
+         mock.patch.object(addon, "_url_alive", side_effect=fake_alive):
+        card = addon._xerver_resolve(
+            "https://mirror.xerver.xyz/get/play.php?url=E", "T", 2025)
+    assert card and card["url"] == "https://r2.example.com/f.mp4"
+    assert alive["https://video-downloads.googleusercontent.com/x"] is True
+
+def test_v220_movie_cards_parallel_embed_and_tr():
+    """embed chain and trdekho grid run CONCURRENTLY: total wall ~= the
+    slower branch, not the sum (old sequential flow paid both: 1.5+1.5)."""
+    _reset()
+    def slow_card(*a, **k):
+        time.sleep(1.5)
+        return {"name": "E", "description": "d", "url": "https://e/1"}
+    def slow_tr(*a, **k):
+        time.sleep(1.5)
+        return [{"name": "T", "description": "d", "url": "https://t/1"}]
+    pg = {"embed": "https://animedekho.app/embed/1/",
+          "tr_servers": ["https://animedekho.app/?trdekho=0&trid=1&trtype=1"],
+          "post_id": "1", "title": "T"}
+    with mock.patch.object(addon, "_resolve_card",
+                           side_effect=slow_card), \
+         mock.patch.object(addon, "_resolve_trservers",
+                           side_effect=slow_tr):
+        t0 = time.time()
+        cards = addon._movie_cards(pg, "T", 2025,
+                                   deadline=time.time() + 8)
+        dt = time.time() - t0
+    assert len(cards) == 2, "embed + tr card both land"
+    assert dt < 2.4, "parallel wall %.1fs (sequential would be ~3s)" % dt
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]

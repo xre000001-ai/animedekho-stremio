@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "2.1.0"
+VERSION = "2.2.2"
 BRAND   = "AnimeDekho"
 ADDON_NAME = "ΛNIME | VERSE"      # v1.7.0 user-named brand
 ADDON_LOGO = "https://i.postimg.cc/pXvhmfg1/Chat-GPT-Image-Sep-12-2026-11-32-08-AM.png"
@@ -139,7 +139,10 @@ _STALE_SWEEP_AT = 256
 
 # v1.5.0: one shared IO pool for the parallel innards (search queries run
 # together, subs race the master chain, candidates resolve concurrently)
-_IO_EX = ThreadPoolExecutor(max_workers=10, thread_name_prefix="io")
+# v2.2.0: 14 workers — _movie_cards now nests one branch-future per
+# movie worker on top of the trdekho slot futures; the extra headroom
+# keeps saturation latencies out of the cold path.
+_IO_EX = ThreadPoolExecutor(max_workers=14, thread_name_prefix="io")
 _SUBS_EX = ThreadPoolExecutor(max_workers=4, thread_name_prefix="subs")
 _PREWARM = {"cycles": 0, "cards": 0, "posts": 0, "last": 0.0, "epis": []}
 # v1.5.0: in-memory index of the newest site posts (title/url/family).
@@ -1192,14 +1195,23 @@ def _blakite_resolve(embed_url, site_title, year):
     except Exception:
         return None
 
-def _url_alive(url, timeout=8):
+def _url_alive(url, timeout=8, need_206=False):
     """Light liveness probe for a direct media file: Range + stream +
     close — never buffers a whole multi-GB body (v1.9.6 lesson from the
-    raretoons V2 servers that ignore Range)."""
+    raretoons V2 servers that ignore Range).
+    v2.2.0: need_206=True additionally requires the server to HONOUR the
+    Range request (206 + Content-Range). xerver's instant_dl blobs reply
+    200-full-body with no Accept-Ranges at all ('No-Forward-Backward' is
+    literally their label for it) — a 1.6GB unseekable video/mkv that no
+    player can stream. Those are NOT playable cards; only 206-capable
+    CDNs (cloud_r2 / direct_mgt) pass the gate."""
     try:
         r = _S.get(url, headers={"User-Agent": UA, "Range": "bytes=0-1023"},
                    timeout=timeout, stream=True)
         ok = r.status_code in (200, 206)
+        if ok and need_206:
+            ok = (r.status_code == 206
+                  and bool(r.headers.get("Content-Range")))
         try:
             r.raw.read(64)
         except Exception:
@@ -1230,8 +1242,8 @@ def _xerver_resolve(player_url, site_title, year):
             u = (res.get(key) or {}).get("url") or ""
             if not u.startswith("http"):
                 continue
-            if not _url_alive(u):          # no phantom cards
-                continue
+            if not _url_alive(u, need_206=True):   # no phantom, no
+                continue                            # unseekable cards
             name, desc = _fmt_stream_card(
                 site_title, {"res": [], "langs": [], "audio_rends": []},
                 [], "movie", 1, 1, year, fam="xerver")
@@ -1421,20 +1433,46 @@ def _resolve_trservers(site_title, tr_servers, post_id, year,
             _CARD_STALE[ckey] = (time.time() + _CARD_STALE_TTL, out)
     return out or None
 
-def _movie_cards(pg, ctitle, year, deadline=None):
+def _movie_cards(pg, ctitle, year, deadline=None, trace=None):
     """movie page-info -> list of cards (embed card + trdekho cards).
     Old posts: embed only; new posts: trdekho only; dual-pattern posts:
-    both — embed first, then the multi-server extras."""
-    out = []
+    both — embed first, then the multi-server extras.
+    v2.2.0: the embed chain and the trdekho grid run CONCURRENTLY (the
+    old sequential flow paid embed (~3-5s) + trdekho (~5-8s) back to
+    back — the single biggest slice of the cold-build wall)."""
+    if deadline is None:
+        deadline = time.time() + _WALL
+    fut_e = fut_t = None
     if pg.get("embed"):
-        card = _resolve_card(pg.get("title") or ctitle, pg["embed"],
-                             "movie", 1, 1, year, deadline=deadline)
+        fut_e = _IO_EX.submit(_resolve_card, pg.get("title") or ctitle,
+                              pg["embed"], "movie", 1, 1, year,
+                              deadline=deadline - 0.1)
+    if pg.get("tr_servers"):
+        fut_t = _IO_EX.submit(_resolve_trservers,
+                              pg.get("title") or ctitle,
+                              pg["tr_servers"], pg.get("post_id"),
+                              year, deadline=deadline - 0.1)
+    out = []
+    t0 = time.time()
+    if fut_e is not None:
+        try:
+            card = fut_e.result(timeout=max(0.2, deadline - time.time()))
+        except Exception:
+            card = None
+        if trace is not None:
+            trace["embed_ms"] = int((time.time() - t0) * 1000)
+            trace["embed_ok"] = bool(card)
         if card:
             out.append(card)
-    if pg.get("tr_servers"):
-        trs = _resolve_trservers(pg.get("title") or ctitle,
-                                 pg["tr_servers"], pg.get("post_id"),
-                                 year, deadline=deadline)
+    t1 = time.time()
+    if fut_t is not None:
+        try:
+            trs = fut_t.result(timeout=max(0.2, deadline - time.time()))
+        except Exception:
+            trs = None
+        if trace is not None:
+            trace["tr_ms"] = int((time.time() - t1) * 1000)
+            trace["tr_n"] = len(trs or [])
         if trs:
             out.extend(trs[:2])
     return out
@@ -1967,18 +2005,22 @@ class Handler(BaseHTTPRequestHandler):
                 cands = search_candidates(t)
                 tr["search"] = "%d cands %.1fs %s" % (
                     len(cands), time.time() - t0,
-                    (cands[0][0][:48] if cands else "-"))
+                    (cands[0].get("title", "?")[:48] if cands else "-"))
                 if not cands:
                     return self._send(200, json.dumps(tr))
+                t1 = time.time()
                 pg = _parse_movie_page(cands[0][1])
-                tr["page"] = ("embed=%s tr=%d post=%s %.1fs" % (
+                tr["page_ms"] = int((time.time() - t1) * 1000)
+                tr["page"] = ("embed=%s tr=%d post=%s" % (
                     pg.get("embed"), len(pg.get("tr_servers") or []),
-                    pg.get("post_id"), time.time() - t0)) if pg else "FAIL"
+                    pg.get("post_id"))) if pg else "FAIL"
                 if not pg:
                     return self._send(200, json.dumps(tr))
                 dl = time.time() + 20
-                cards = _movie_cards(pg, t, int(y), deadline=dl)
-                tr["cards"] = "%d/%d" % (len(cards), 4)
+                trc = {}
+                cards = _movie_cards(pg, t, int(y), deadline=dl, trace=trc)
+                tr.update(trc)
+                tr["cards"] = "%d" % len(cards)
                 tr["names"] = [c.get("name", "?")[:40] for c in cards]
                 tr["ms"] = int((time.time() - t0) * 1000)
             except Exception as e:
