@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "2.2.5"
+VERSION = "2.2.6"
 BRAND   = "AnimeDekho"
 ADDON_NAME = "ΛNIME | VERSE"      # v1.7.0 user-named brand
 ADDON_LOGO = "https://i.postimg.cc/pXvhmfg1/Chat-GPT-Image-Sep-12-2026-11-32-08-AM.png"
@@ -73,7 +73,11 @@ _CARD_TTL     = 40 * 60          # resolved-card cache (must stay < _MASTER_TTL
                                  # so a cached card never outlives its relay)
 _CARD_STALE_TTL = 110 * 60       # SWR ceiling for cards
 _PREWARM_EVERY   = 10 * 60       # background warm cycle for the newest posts
-_WALL         = 20.0              # player-facing wall for one /stream build
+_WALL         = 24.0              # v2.2.6: 20 -> 24: a cold build during
+                                   # pool contention finished ~21s and the
+                                   # 20s wall cut it into "slow, tap again";
+                                   # warm taps stay <1s so only the rare
+                                   # pathological cold tap pays the extra
 
 # v1.6.0: trdekho players (vidmoly) use ISO 639-1 two-letter codes
 _LANG_NAME = {"hi": "Hindi", "en": "English", "ja": "Japanese",
