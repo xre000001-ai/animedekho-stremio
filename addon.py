@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.9.9"
+VERSION = "2.0.0"
 BRAND   = "AnimeDekho"
 ADDON_NAME = "ΛNIME | VERSE"      # v1.7.0 user-named brand
 ADDON_LOGO = "https://i.postimg.cc/pXvhmfg1/Chat-GPT-Image-Sep-12-2026-11-32-08-AM.png"
@@ -2031,6 +2031,40 @@ class Handler(BaseHTTPRequestHandler):
             if k != "adk-dbg-9c2f" or not kw:
                 return self._send(404, json.dumps({"error": "not found"}))
             try:
+                burst = (q.get("burst") or [""])[0] == "1"
+                if burst:
+                    # v2.0.0 diag: fire the exact search_candidates queries
+                    # CONCURRENTLY, cache-bypassed, with per-query status
+                    words = re.sub(r"[^\w\s]", " ", kw).split()
+                    queries = [kw]
+                    if len(words) >= 3:
+                        queries.append(" ".join(words[:3]))
+                    if len(words) >= 2:
+                        queries.append(" ".join(words[:2]))
+                    if words and len(words[0]) >= 4:
+                        queries.append(words[0])
+                    uniq = list(dict.fromkeys(queries))[:4]
+                    def raw(qq):
+                        t0 = time.time()
+                        try:
+                            rr = _get(SITE + "/?s=" + quote(qq), timeout=12)
+                            cc = _extract_cards(rr.text) \
+                                if rr.status_code == 200 else []
+                            return {"q": qq, "status": rr.status_code,
+                                    "bytes": len(rr.text), "cards": len(cc),
+                                    "ms": int((time.time() - t0) * 1000)}
+                        except Exception as e:
+                            return {"q": qq, "err": type(e).__name__,
+                                    "ms": int((time.time() - t0) * 1000)}
+                    res = list(_IO_EX.map(raw, uniq))
+                    return self._send(200, json.dumps(
+                        {"burst": res,
+                         "pool_alive": [u for u, _l in _FREE_POOL[0]
+                                         if _POOL_BAD.get(u, 0.0) <=
+                                         time.time()][:6],
+                         "n_benched": sum(1 for u in _FREE_POOL[0]
+                                          if _POOL_BAD.get(u, 0.0) >
+                                          time.time())}))
                 r = _get(SITE + "/?s=" + quote(kw), timeout=12)
                 cards = _extract_cards(r.text) if r.status_code == 200 else []
                 return self._send(200, json.dumps({
