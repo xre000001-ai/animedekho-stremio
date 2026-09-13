@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.9.6"
+VERSION = "1.9.7"
 BRAND   = "AnimeDekho"
 ADDON_NAME = "ΛNIME | VERSE"      # v1.7.0 user-named brand
 ADDON_LOGO = "https://i.postimg.cc/pXvhmfg1/Chat-GPT-Image-Sep-12-2026-11-32-08-AM.png"
@@ -1910,6 +1910,48 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._send(200, json.dumps(
                     {"error": "%s: %s" % (type(e).__name__, str(e)[:120])}))
+
+        if path == "/debug/movie":
+            # v1.9.7 diagnostic: movie-page gate forensics from THIS host
+            k = (q.get("k") or [""])[0]
+            u = (q.get("url") or [""])[0]
+            if k != "adk-dbg-9c2f" or not u.startswith("http"):
+                return self._send(404, json.dumps({"error": "not found"}))
+            out = {}
+            try:
+                r = _get(u, timeout=12)
+                h = r.text or ""
+                m1 = re.search(r"animedekho\.app/embed/(\d+)", h)
+                out["page_status"] = r.status_code
+                out["page_bytes"] = len(h)
+                out["embed"] = m1.group(1) if m1 else None
+                ht = re.search(r'<h1 class="entry-title">([^<]*)</h1>', h)
+                out["h1"] = ht.group(1)[:60] if ht else ""
+                sl = re.search(r'name="shortlink"\s+value="([^"]+)"', h)
+                out["shortlink"] = "yes" if sl else None
+                if not m1 and sl and "verify.php" in sl.group(1):
+                    rv = _get(sl.group(1), timeout=10)
+                    out["verify_status"] = rv.status_code
+                    r2 = _get(u, timeout=10)
+                    h2 = r2.text or ""
+                    out["reload_status"] = r2.status_code
+                    out["reload_bytes"] = len(h2)
+                    m2 = re.search(r"animedekho\.app/embed/(\d+)", h2)
+                    out["embed_after_gate"] = m2.group(1) if m2 else None
+                    trs = []
+                    for b64 in re.findall(
+                            r'data-(?:src|url|link)="([A-Za-z0-9+/=]{16,})"', h2):
+                        try:
+                            d = base64.b64decode(b64).decode("utf-8", "ignore")
+                        except Exception:
+                            continue
+                        if "trdekho=" in d:
+                            trs.append(d)
+                    out["tr_servers_after_gate"] = len(trs)
+                out["cookies"] = sorted(c.name for c in _S.cookies)
+            except Exception as e:
+                out["error"] = "%s: %s" % (type(e).__name__, str(e)[:120])
+            return self._send(200, json.dumps(out))
 
         if path == "/debug/tr":
             # v1.6.4: trdekho grid forensics from THIS host's egress —
