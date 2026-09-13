@@ -6,6 +6,7 @@ import re
 import sys
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -1066,6 +1067,96 @@ def test_v196_url_alive_never_buffers_body():
         h = g.call_args[1]["headers"]
         assert h["Range"] == "bytes=0-1023"
         assert g.call_args[1]["stream"] is True
+
+
+
+
+# --- v2.1.0: pool resilience (prod empty-pool death spiral) -------------------
+
+def test_v210_empty_pool_refresh_wait_recovers():
+    """the prod death spiral: pool empty, a refresh is already running
+    (~25s). v1.x callers fell straight through to the direct 403; v2.1.0
+    callers WAIT for the rebuild and then succeed."""
+    _reset()
+    calls = {"pick": 0}
+    real_pick = addon._pick_exit
+    class FakeResp:
+        status_code = 200
+        text = "animedekho homepage"
+    def pick(now):
+        calls["pick"] += 1
+        if calls["pick"] <= 1:          # first pick: empty pool
+            return None
+        return "http://good-exit:8080"
+    def refresh(force=False, wait=False):
+        assert wait is True, "must wait for the in-flight rebuild"
+        return None
+    with mock.patch.object(addon, "_pick_exit", side_effect=pick), \
+         mock.patch.object(addon, "_pool_refresh", side_effect=refresh), \
+         mock.patch.object(addon._S, "get", return_value=FakeResp()) as g:
+        r = addon._get("https://animedekho.app/?s=x", timeout=5)
+    assert r.status_code == 200
+    assert g.call_args[1]["proxies"]["http"] == "http://good-exit:8080"
+
+def test_v210_refresh_forgives_benches_when_nothing_found():
+    """a refresh that finds zero good exits must NOT leave the pool
+    empty — it forgives the benches and keeps the last exits."""
+    _reset()
+    _reset_pool_state()
+    addon._FREE_POOL[0] = [("http://e1:1", 1.0), ("http://e2:2", 1.5)]
+    addon._POOL_BAD["http://e1:1"] = time.time() + 500
+    addon._POOL_BAD["http://e2:2"] = time.time() + 500
+    class EmptyList:
+        status_code = 200
+        text = ""                       # list endpoint serves nothing
+    with mock.patch.object(addon._S, "get", return_value=EmptyList()):
+        addon._pool_refresh(force=True)
+    assert addon._FREE_POOL[0], "pool must never go empty"
+    assert not any(addon._POOL_BAD.get(u, 0) > time.time()
+                   for u, _ in addon._FREE_POOL[0])
+
+def test_v210_site_semaphore_caps_concurrency():
+    """the movie grid (~16 parallel site fetches) must not melt the top
+    exits: at most 5 pooled site fetches run at once."""
+    _reset()
+    import threading
+    live = [0]; peak = [0]; lk = threading.Lock()
+    class Slow:
+        status_code = 200
+        text = "animedekho"
+    def slow_get(url, **kw):
+        with lk:
+            live[0] += 1; peak[0] = max(peak[0], live[0])
+        time.sleep(0.35)
+        with lk:
+            live[0] -= 1
+        return Slow()
+    with mock.patch.object(addon, "_pick_exit",
+                           return_value="http://x:1"), \
+         mock.patch.object(addon._S, "get", side_effect=slow_get), \
+         mock.patch.object(addon, "_DIRECT_OK_UNTIL", [0.0]), \
+         mock.patch.object(addon, "_DIRECT_RETRY_AT", [time.time() + 999]):
+        with ThreadPoolExecutor(max_workers=12) as ex:
+            rs = list(ex.map(lambda i: addon._get(
+                "https://animedekho.app/p%d" % i, timeout=6), range(12)))
+    assert all(r.status_code == 200 for r in rs)
+    assert peak[0] <= 5, "site-pool concurrency must cap at 5, saw %d" % peak[0]
+
+def test_v210_cdn_fetches_bypass_the_site_semaphore():
+    """as-cdn/player fetches never wait on the site semaphore."""
+    _reset()
+    class R:
+        status_code = 200
+        text = "x"
+    def fast(u, **kw):
+        return R()
+    with mock.patch.object(addon._S, "get", side_effect=fast):
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            rs = list(ex.map(lambda i: addon._get(
+                "https://as-cdn26.top/v%d" % i, timeout=3), range(10)))
+    assert all(r.status_code == 200 for r in rs)
+    assert time.time() - t0 < 1.5
 
 
 if __name__ == "__main__":

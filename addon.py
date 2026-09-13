@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 BRAND   = "AnimeDekho"
 ADDON_NAME = "ΛNIME | VERSE"      # v1.7.0 user-named brand
 ADDON_LOGO = "https://i.postimg.cc/pXvhmfg1/Chat-GPT-Image-Sep-12-2026-11-32-08-AM.png"
@@ -190,6 +190,15 @@ _FREE_POOL = [[]]                 # alive free exits (http://ip:port)
 _POOL_BAD = {}                    # url -> benched-until ts
 _POOL_STICKY = [None, 0.0]        # last good exit, sticky-until ts
 _POOL_TS = [0.0]                  # last refresh start (throttle 4 min)
+# v2.1.0: a refresh takes ~25s (proxy list + 24-way probe). When the
+# pool ran empty, parallel _get callers used to see "refresh already
+# running" and instantly fall through to the direct 403 — the pool
+# NEVER recovered inside a build. Now callers can WAIT for the build
+# to land, an empty pool refreshes every 60s (not 240), and a refresh
+# that finds zero good exits forgives the benches instead of leaving
+# the pool empty (a stale exit beats no exit).
+_POOL_BUILD_LOCK = threading.Lock()
+_SITE_SEM = threading.BoundedSemaphore(5)   # pooled site fetch cap
 _POOL_LOCK = threading.Lock()
 _DIRECT_OK_UNTIL = [time.time()]  # direct egress believed healthy until
 _DIRECT_RETRY_AT = [0.0]          # earliest re-probe after a block
@@ -210,36 +219,54 @@ def _site_ok_via(url, timeout=5):
     except Exception:
         return None
 
-def _pool_refresh(force=False):
+def _pool_refresh(force=False, wait=False):
     now = time.time()
-    if not force and now - _POOL_TS[0] < 240:
+    cadence = 60.0 if not _FREE_POOL[0] else 240.0
+    if not force and now - _POOL_TS[0] < cadence:
         return
-    with _POOL_LOCK:
-        if now - _POOL_TS[0] < 240:            # someone refreshed meanwhile
+    if not _POOL_BUILD_LOCK.acquire(timeout=(25.0 if wait else 0.0)):
+        return                                  # a build is running; the
+    try:                                        # caller re-picks after it
+        now = time.time()
+        cadence = 60.0 if not _FREE_POOL[0] else 240.0
+        if now - _POOL_TS[0] < cadence:         # someone refreshed meanwhile
             return
         _POOL_TS[0] = now
-    try:
-        r = _S.get(_POOL_SRC, timeout=20, headers={"User-Agent": UA})
-        cand = [u.strip() for u in r.text.replace("\r", "").splitlines()
-                if u.strip().startswith("http://")]
-        random.shuffle(cand)
-        cand = cand[:120]
-        good = []
-        with ThreadPoolExecutor(max_workers=24) as ex:
-            for res in ex.map(_site_ok_via, cand):
-                if res:
-                    good.append(res)          # [(url, latency)]
-        good.sort(key=lambda x: x[1])         # fastest first
-        with _POOL_LOCK:
-            prev = [u for u in _FREE_POOL[0]
-                    if _POOL_BAD.get(u, 0.0) <= time.time()]
-            pmap = {u: l for u, l in prev}
-            for u, l in good:
-                pmap[u] = min(pmap.get(u, 99.0), l)   # keep best latency
-            merged = sorted(pmap.items(), key=lambda x: x[1])[:25]
-            _FREE_POOL[0] = merged or prev
-    except Exception:
-        pass
+        try:
+            r = _S.get(_POOL_SRC, timeout=20, headers={"User-Agent": UA})
+            cand = [u.strip() for u in r.text.replace("\r", "").splitlines()
+                    if u.strip().startswith("http://")]
+            random.shuffle(cand)
+            cand = cand[:120]
+            good = []
+            with ThreadPoolExecutor(max_workers=24) as ex:
+                for res in ex.map(_site_ok_via, cand):
+                    if res:
+                        good.append(res)      # [(url, latency)]
+            good.sort(key=lambda x: x[1])     # fastest first
+            with _POOL_LOCK:
+                # v2.1.0 FIX: _FREE_POOL holds (url, latency) PAIRS — the
+                # old `for u in` filter passed the PAIR to _POOL_BAD.get
+                # (string keys), so benched exits were NEVER filtered and
+                # an all-benched pool could not recover until the benches
+                # expired (prod death spiral: 403 on every site fetch).
+                prev = [(u, l) for u, l in _FREE_POOL[0]
+                        if _POOL_BAD.get(u, 0.0) <= time.time()]
+                pmap = {u: l for u, l in prev}
+                for u, l in good:
+                    pmap[u] = min(pmap.get(u, 99.0), l)  # best latency
+                merged = sorted(pmap.items(), key=lambda x: x[1])[:25]
+                if not merged and _FREE_POOL[0]:
+                    # v2.1.0: forgive the benches — an empty pool is a
+                    # guaranteed 403 for every site fetch on prod
+                    for u, _l in _FREE_POOL[0]:
+                        _POOL_BAD.pop(u, None)
+                    merged = list(_FREE_POOL[0])
+                _FREE_POOL[0] = merged or prev
+        except Exception:
+            pass
+    finally:
+        _POOL_BUILD_LOCK.release()
 
 def _pick_exit(now):
     if _POOL_STICKY[0] and now < _POOL_STICKY[1]:
@@ -251,10 +278,10 @@ def _pick_exit(now):
                 if _POOL_BAD.get(u, 0.0) <= now]
     if not live:
         return None
-    # v1.5.0: random among the 3 FASTEST exits (pure best-of-one would
-    # overload a single free proxy; top-3 keeps latency without the
-    # thundering herd)
-    top = [u for u, _l in live[:3]]
+    # v1.5.0/v2.1.0: random among the 5 FASTEST exits (pure best-of-one
+    # would overload a single free proxy; the movie grid fires ~16 site
+    # fetches at once and top-3 melted them into timeout benches)
+    top = [u for u, _l in live[:5]]
     return random.choice(top) if top else live[0][0]
 
 class _DeadResponse:
@@ -309,26 +336,34 @@ def _get(url, timeout=8, referer=None):
         if fam_site:                               # real block signal
             _DIRECT_OK_UNTIL[0] = 0.0
             _DIRECT_RETRY_AT[0] = time.time() + 600   # re-probe in 10 min
-    for _ in range(3):
-        u = _pick_exit(time.time())
-        if u is None:
-            _pool_refresh(force=True)
+    # v2.1.0: pooled site fetches are capped at 5 concurrent — the movie
+    # grid fires ~16 site fetches at once and melted the top exits into
+    # timeout benches (series builds, at ~5 fetches, always survived).
+    sem_got = fam_site and _SITE_SEM.acquire(timeout=25.0)
+    try:
+        for _ in range(3):
             u = _pick_exit(time.time())
             if u is None:
-                break
-        try:
-            r = _S.get(url, headers=hd, timeout=timeout,
-                       proxies={"http": u, "https": u})
-            if r.status_code in (403, 406):
-                _POOL_BAD[u] = time.time() + 900   # exit blocked by site
-            else:
-                _POOL_STICKY[0] = u                # [url, expiry] pair
-                _POOL_STICKY[1] = time.time() + 90
-                return r
-        except Exception:
-            _POOL_BAD[u] = time.time() + 600       # dead exit
-        _POOL_STICKY[0] = None
-        _POOL_STICKY[1] = 0.0
+                _pool_refresh(force=True, wait=True)
+                u = _pick_exit(time.time())
+                if u is None:
+                    continue
+            try:
+                r = _S.get(url, headers=hd, timeout=timeout,
+                           proxies={"http": u, "https": u})
+                if r.status_code in (403, 406):
+                    _POOL_BAD[u] = time.time() + 900   # exit blocked
+                else:
+                    _POOL_STICKY[0] = u                # [url, expiry] pair
+                    _POOL_STICKY[1] = time.time() + 90
+                    return r
+            except Exception:
+                _POOL_BAD[u] = time.time() + 600       # dead exit
+            _POOL_STICKY[0] = None
+            _POOL_STICKY[1] = 0.0
+    finally:
+        if sem_got:
+            _SITE_SEM.release()
     try:                                            # last resort: direct
         return _S.get(url, headers=hd, timeout=timeout)
     except Exception:
@@ -2062,7 +2097,7 @@ class Handler(BaseHTTPRequestHandler):
                          "pool_alive": [u for u, _l in _FREE_POOL[0]
                                          if _POOL_BAD.get(u, 0.0) <=
                                          time.time()][:6],
-                         "n_benched": sum(1 for u in _FREE_POOL[0]
+                         "n_benched": sum(1 for u, _l in _FREE_POOL[0]
                                           if _POOL_BAD.get(u, 0.0) >
                                           time.time())}))
                 r = _get(SITE + "/?s=" + quote(kw), timeout=12)
