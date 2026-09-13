@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "2.2.3"
+VERSION = "2.2.4"
 BRAND   = "AnimeDekho"
 ADDON_NAME = "ΛNIME | VERSE"      # v1.7.0 user-named brand
 ADDON_LOGO = "https://i.postimg.cc/pXvhmfg1/Chat-GPT-Image-Sep-12-2026-11-32-08-AM.png"
@@ -1354,7 +1354,7 @@ def _resolve_trservers(site_title, tr_servers, post_id, year,
     chain_futs = {}                     # chain future -> family tag
     out, seen = [], set()
     timed_out = False
-    page_deadline = min(deadline, time.time() + 6)   # v1.8.0: faster
+    page_deadline = min(deadline, time.time() + 5)   # v2.2.4: faster
     try:
         for f in as_completed(page_futs,
                               timeout=max(1.0, page_deadline - time.time())):
@@ -1384,7 +1384,7 @@ def _resolve_trservers(site_title, tr_servers, post_id, year,
                               timeout=max(0.5, deadline - time.time())):
             if len(out) >= 4 or time.time() >= deadline:
                 break
-            if first_card_ts and time.time() > first_card_ts + 3:
+            if first_card_ts and time.time() > first_card_ts + 2.5:
                 break
             fam = chain_futs[f]
             try:
@@ -1624,8 +1624,8 @@ def _build_inner(ctype, imdb, se, ep, deadline=None):
         # from later ones hostage. Losing workers keep running; their
         # cards land in _CARD_CACHE for the next tap.
         futs = [_IO_EX.submit(worker, c) for c in matched[:3]]
-        first_ts = None                # v1.9.2: after the first cards
-        for f in as_completed(futs):   # land, wait max 2.5s for extras
+        first_ts = None                # v2.2.4: after the first cards
+        for f in as_completed(futs):   # land, wait max 1.5s for extras
             if time.time() >= deadline:
                 break
             if first_ts is not None and time.time() > first_ts + 2.5:
@@ -1633,7 +1633,7 @@ def _build_inner(ctype, imdb, se, ep, deadline=None):
             try:
                 card = f.result(timeout=max(
                     0.2, min(deadline,
-                             (first_ts or deadline) + 2.5) - time.time()))
+                             (first_ts or deadline) + 1.5) - time.time()))
             except Exception:
                 card = None
             if card:
