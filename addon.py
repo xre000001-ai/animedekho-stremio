@@ -51,7 +51,7 @@ import requests
 # --------------------------------------------------------------------------
 # 1. config
 # --------------------------------------------------------------------------
-VERSION = "1.9.5"
+VERSION = "1.9.6"
 BRAND   = "AnimeDekho"
 ADDON_NAME = "ΛNIME | VERSE"      # v1.7.0 user-named brand
 ADDON_LOGO = "https://i.postimg.cc/pXvhmfg1/Chat-GPT-Image-Sep-12-2026-11-32-08-AM.png"
@@ -926,7 +926,9 @@ def _fmt_stream_card(site_title, info, subs, ctype, se, ep, year,
     don't have is dropped honestly, never faked."""
     res = info.get("res") or []
     mx = max(res) if res else 0
-    if mx >= 1080:
+    if not res:
+        ql = "DIRECT"          # v1.9.6: unknown quality — honest, never faked
+    elif mx >= 1080:
         ql = "FHD 1080p"
     elif mx >= 720:
         ql = "HD %dp" % mx
@@ -1155,14 +1157,66 @@ def _blakite_resolve(embed_url, site_title, year):
     except Exception:
         return None
 
+def _url_alive(url, timeout=8):
+    """Light liveness probe for a direct media file: Range + stream +
+    close — never buffers a whole multi-GB body (v1.9.6 lesson from the
+    raretoons V2 servers that ignore Range)."""
+    try:
+        r = _S.get(url, headers={"User-Agent": UA, "Range": "bytes=0-1023"},
+                   timeout=timeout, stream=True)
+        ok = r.status_code in (200, 206)
+        try:
+            r.raw.read(64)
+        except Exception:
+            pass
+        r.close()
+        return ok
+    except Exception:
+        return False
+
+# v1.9.6: mirror.xerver.xyz (trdekho slots) — the player page's own
+# fetchLinks() AJAX (?url={enc}&fetch=1, Referer only) answers
+# {results: {instant_dl|cloud_r2|direct_mgt: {url,label}}} — DIRECT
+# .mp4 files (googleusercontent / Cloudflare R2 / MGT). Verified
+# 2026-09-13: plain Referer-only call works; the page's own
+# SERVER_ORDER is honoured; dead files honestly skip.
+_XERVER_ORDER = ("instant_dl", "cloud_r2", "direct_mgt")
+
+def _xerver_resolve(player_url, site_title, year):
+    """xerver play.php url -> one verified DIRECT card (first live key)."""
+    try:
+        api = player_url if "fetch=1" in player_url \
+            else player_url + "&fetch=1"
+        r = _get(api, timeout=8, referer=SITE + "/")
+        if r.status_code != 200:
+            return None
+        res = (r.json() or {}).get("results") or {}
+        for key in _XERVER_ORDER:
+            u = (res.get(key) or {}).get("url") or ""
+            if not u.startswith("http"):
+                continue
+            if not _url_alive(u):          # no phantom cards
+                continue
+            name, desc = _fmt_stream_card(
+                site_title, {"res": [], "langs": [], "audio_rends": []},
+                [], "movie", 1, 1, year, fam="xerver")
+            return {"name": name, "description": desc, "url": u,
+                    "behaviorHints": {"notWebReady": False,
+                                      "isBingeable": True},
+                    "bingeGroup": "adk|%s|xerver" % site_title}
+        return None
+    except Exception:
+        return None
+
 _TR_FAM_TAG = (("emturbovid", "emturbo"), ("turboviplay", "emturbo"),
-               ("blakiteapi", "blakite"), ("as-cdn", "cdn"))
+               ("blakiteapi", "blakite"), ("xerver.xyz", "xerver"),
+               ("as-cdn", "cdn"))
 # v1.6.7: emturbo FIRST — its GDrive segments are IP-free and always
 # play. v1.8.0: vidmoly removed entirely (user directive; its master
 # token was minting-IP-bound, so the card was unreliable anyway).
 # v1.9.5: blakite joins the resolvable set (Rumble-backed chunklist,
 # fully open) — after emturbo (GDrive), before the gated cdn.
-_TR_PRIO = {"emturbo": 0, "blakite": 1, "cdn": 2}
+_TR_PRIO = {"emturbo": 0, "blakite": 1, "cdn": 2, "xerver": 3}
 
 def _tr_fam_tag(u):
     for k, v in _TR_FAM_TAG:
@@ -1209,7 +1263,7 @@ def _neg_bg_retry(ckey, fn, *args):
 
 def _resolve_trservers(site_title, tr_servers, post_id, year,
                        force=False, deadline=None):
-    """trdekho server pages -> up to 3 extra cards (v1.9.5: +blakite).
+    """trdekho server pages -> up to 4 extra cards (v1.9.6: +xerver).
     All player pages fetch in parallel; resolvable players run in
     priority order (emturbo > as-cdn), deduped by master
     (query-stripped). Cached + SWR under ('tr'+post_id, 1, 1)."""
@@ -1265,9 +1319,13 @@ def _resolve_trservers(site_title, tr_servers, post_id, year,
                 p = None
             fam = _tr_fam_tag(p) if p else None
             if fam and len(chain_futs) < 4:
-                # v1.9.5: blakite builds its own (already verified) card
+                # v1.9.5/1.9.6: blakite + xerver build their own
+                # (already verified) direct cards
                 if fam == "blakite":
                     chain_futs[_IO_EX.submit(_blakite_resolve, p,
+                                             site_title, year)] = fam
+                elif fam == "xerver":
+                    chain_futs[_IO_EX.submit(_xerver_resolve, p,
                                              site_title, year)] = fam
                 else:
                     chain_futs[_IO_EX.submit(_player_master, p)] = fam
@@ -1277,7 +1335,7 @@ def _resolve_trservers(site_title, tr_servers, post_id, year,
     try:                                     # lands, wait max 3s for a 2nd
         for f in as_completed(list(chain_futs),
                               timeout=max(0.5, deadline - time.time())):
-            if len(out) >= 3 or time.time() >= deadline:
+            if len(out) >= 4 or time.time() >= deadline:
                 break
             if first_card_ts and time.time() > first_card_ts + 3:
                 break
@@ -1286,8 +1344,13 @@ def _resolve_trservers(site_title, tr_servers, post_id, year,
                 fres = f.result()
             except Exception:
                 fres = None
-            if fam == "blakite":           # v1.9.5: a ready card or None
+            if fam in ("blakite", "xerver"):
+                # v1.9.5/1.9.6: a ready verified card or None
                 if fres:
+                    noq = (fres.get("url") or "").split("?", 1)[0]
+                    if noq in seen:
+                        continue
+                    seen.add(noq)
                     out.append((fam, fres))
                     if first_card_ts is None:
                         first_card_ts = time.time()

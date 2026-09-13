@@ -987,6 +987,87 @@ def test_v195_blakite_fam_tag_priority_and_dispatch():
         g.assert_not_called()
 
 
+
+
+# --- v1.9.6: xerver (trdekho slot) — fetch=1 AJAX -> direct cards ------------
+
+XV_API = {
+    "results": {
+        "instant_dl": {"url": "https://video-downloads.googleusercontent.com/x/y",
+                        "label": "No-Forward-Backward"},
+        "telegram": {"url": "https://filesgram.xyz/?start=8_1850y8v4",
+                      "label": "Telegram File"},
+        "gofile_mirrors": {"url": "", "label": "GoFile [Mirrors]"},
+    },
+    "cached": True,
+}
+
+def test_v196_xerver_first_live_key_direct_card():
+    """xerver: ?url={enc}&fetch=1 -> instant_dl direct card; download
+    mirrors (telegram/gofile) are never picked; url DIRECT (no relay)."""
+    _reset()
+    calls = []
+    def fake_get(url, timeout=10, referer=None):
+        calls.append(url)
+        if "fetch=1" in url:
+            return _BKResp(jdict=XV_API)
+        raise AssertionError("unexpected fetch: " + url)
+    with mock.patch.object(addon, "_get", side_effect=fake_get), \
+         mock.patch.object(addon, "_url_alive", return_value=True) as alive:
+        card = addon._xerver_resolve(
+            "https://mirror.xerver.xyz/get/play.php?url=ENC123", "T", 2025)
+    assert card, "card must build"
+    assert card["url"] == XV_API["results"]["instant_dl"]["url"]
+    assert card["url"].startswith("https://")
+    assert "DIRECT" in card["name"], "unknown quality is labelled honestly"
+    assert "xerver" in card["description"]
+    assert card["bingeGroup"] == "adk|T|xerver"
+    assert "fetch=1" in calls[0] and "url=ENC123" in calls[0]
+
+def test_v196_xerver_dead_file_is_honestly_skipped():
+    """a dead direct file -> no card (no phantom cards ever)."""
+    _reset()
+    with mock.patch.object(addon, "_get", return_value=_BKResp(jdict=XV_API)), \
+         mock.patch.object(addon, "_url_alive", return_value=False):
+        assert addon._xerver_resolve(
+            "https://mirror.xerver.xyz/get/play.php?url=E", "T", 2025) is None
+
+def test_v196_xerver_falls_back_to_next_key():
+    """SERVER_ORDER: when instant_dl is absent/empty, cloud_r2 wins."""
+    _reset()
+    api = json.loads(json.dumps(XV_API))
+    del api["results"]["instant_dl"]
+    api["results"]["cloud_r2"] = {"url": "https://r2.example.com/f.mp4",
+                                   "label": "Cloud R2"}
+    def fake_get(url, timeout=10, referer=None):
+        return _BKResp(jdict=api)
+    with mock.patch.object(addon, "_get", side_effect=fake_get), \
+         mock.patch.object(addon, "_url_alive", return_value=True):
+        card = addon._xerver_resolve(
+            "https://mirror.xerver.xyz/get/play.php?url=E", "T", 2025)
+    assert card and card["url"] == "https://r2.example.com/f.mp4"
+
+def test_v196_url_alive_never_buffers_body():
+    """the liveness probe streams 64 bytes and closes — a Range-ignoring
+    multi-GB server can never OOM the addon."""
+    class BigResp:
+        status_code = 200
+        def __init__(self):
+            self.read_n = 0; self.closed = False
+        class raw:
+            @staticmethod
+            def read(n):
+                return b"x" * min(n, 64)
+        def close(self):
+            self.closed = True
+    resp = BigResp()
+    with mock.patch.object(addon._S, "get", return_value=resp) as g:
+        assert addon._url_alive("https://x/f.mp4") is True
+        h = g.call_args[1]["headers"]
+        assert h["Range"] == "bytes=0-1023"
+        assert g.call_args[1]["stream"] is True
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]
